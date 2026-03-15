@@ -1,88 +1,120 @@
 """
 main.py
 -------
-DeFi Multi-Chain Wallet Monitor
+DeFi High-Frequency Multi-Chain Arbitrage Hunter
 
-Reads credentials from environment variables (Replit Secrets), checks the
-native-token balance of a single wallet across Polygon, Arbitrum, and Base,
-then sends a single Telegram report.
+Each cycle:
+  1. Checks native-token wallet balances on Polygon, Arbitrum, Base.
+  2. Scans Uniswap V3 (Polygon), SushiSwap (Arbitrum), PancakeSwap (Base)
+     for every token in the watchlist.
+  3. Calculates net profit after gas fees and flash-loan fee (0.05%).
+  4. Sends a Telegram alert for any opportunity with net profit > $10 USD,
+     including direct DEX swap links.
+  5. Stores the best route in flash_loan.optimal_route for the executor.
 
-Environment variables required (set via Replit Secrets):
-  WALLET_ADDRESS      -- EVM wallet address to monitor (0x...)
-  TELEGRAM_BOT_TOKEN  -- Token from Telegram @BotFather
-  TELEGRAM_CHAT_ID    -- Telegram chat ID to receive alerts
+Required Replit Secrets:
+  WALLET_ADDRESS      — EVM wallet to monitor
+  TELEGRAM_BOT_TOKEN  — from Telegram @BotFather
+  TELEGRAM_CHAT_ID    — target chat for alerts
 
-Optional:
-  RUN_ONCE            -- Set to "true" to run once and exit (default: loop every 60s)
+Optional env vars:
+  RUN_ONCE            — "true" → single pass then exit (default: loop)
+  POLL_INTERVAL       — seconds between scans (default: 60)
+  PRICE_SNAPSHOT      — "true" → send full price table even with no arb found
 """
+
+from __future__ import annotations
 
 import os
 import sys
 import time
+import logging
 
-from monitor import check_all_chains, send_telegram_report
+from monitor import (
+    check_all_chains,
+    send_telegram_report,
+    send_arb_alerts,
+    send_price_snapshot,
+    scan_all_dexes,
+    store_optimal_route,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Config
 # ---------------------------------------------------------------------------
-
-POLL_INTERVAL_SECONDS = 60  # How often to re-check balances when looping
-
 
 def load_config() -> dict:
-    """Load and validate required environment variables."""
-    config = {
-        "wallet_address": os.environ.get("WALLET_ADDRESS", "").strip(),
+    cfg = {
+        "wallet_address":     os.environ.get("WALLET_ADDRESS", "").strip(),
         "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
-        "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
-        "run_once": os.environ.get("RUN_ONCE", "false").lower() == "true",
+        "telegram_chat_id":   os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
+        "run_once":           os.environ.get("RUN_ONCE", "false").lower() == "true",
+        "poll_interval":      int(os.environ.get("POLL_INTERVAL", "60")),
+        "price_snapshot":     os.environ.get("PRICE_SNAPSHOT", "false").lower() == "true",
     }
 
-    missing = [
-        key
-        for key, value in {
-            "WALLET_ADDRESS": config["wallet_address"],
-            "TELEGRAM_BOT_TOKEN": config["telegram_bot_token"],
-            "TELEGRAM_CHAT_ID": config["telegram_chat_id"],
-        }.items()
-        if not value
-    ]
+    missing = [k for k, v in {
+        "WALLET_ADDRESS":     cfg["wallet_address"],
+        "TELEGRAM_BOT_TOKEN": cfg["telegram_bot_token"],
+        "TELEGRAM_CHAT_ID":   cfg["telegram_chat_id"],
+    }.items() if not v]
 
     if missing:
         print(
-            f"[ERROR] Missing required environment variable(s): {', '.join(missing)}\n"
-            "Set them in Replit Secrets and restart.",
+            f"[ERROR] Missing secret(s): {', '.join(missing)}\n"
+            "Add them in Replit Secrets and restart.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    return config
+    return cfg
 
 
 # ---------------------------------------------------------------------------
-# Core monitoring logic
+# One monitoring cycle
 # ---------------------------------------------------------------------------
 
-def run_check(config: dict) -> None:
-    """Perform one full monitoring cycle: check balances → send report."""
-    print(f"[Monitor] Checking balances for wallet: {config['wallet_address']}")
+def run_cycle(cfg: dict) -> None:
+    bot   = cfg["telegram_bot_token"]
+    chat  = cfg["telegram_chat_id"]
 
-    results = check_all_chains(config["wallet_address"])
-
-    for r in results:
+    # ── 1. Wallet balance check ────────────────────────────────────────────
+    logger.info("=== Wallet balance check ===")
+    balance_results = check_all_chains(cfg["wallet_address"])
+    for r in balance_results:
         if r["error"]:
-            print(f"  [{r['name']}] ERROR: {r['error']}")
+            logger.warning(f"  [{r['name']}] ERROR: {r['error']}")
         else:
-            flag = " *** LOW BALANCE ***" if r["is_low"] else ""
-            print(
-                f"  [{r['name']}] {r['balance']:.6f} {r['native_token']}{flag}"
-            )
+            flag = " *** LOW ***" if r["is_low"] else ""
+            logger.info(f"  [{r['name']}] {r['balance']:.6f} {r['native_token']}{flag}")
 
-    send_telegram_report(
-        bot_token=config["telegram_bot_token"],
-        chat_id=config["telegram_chat_id"],
-        results=results,
-    )
+    send_telegram_report(bot, chat, balance_results)
+
+    # ── 2. Price scan across all DEXes ────────────────────────────────────
+    logger.info("=== Price scan across DEXes ===")
+    all_prices, opportunities = scan_all_dexes()
+
+    # ── 3. Store optimal route for flash-loan executor ────────────────────
+    best = opportunities[0] if opportunities else None
+    store_optimal_route(best)
+
+    # ── 4. Send Telegram alerts ───────────────────────────────────────────
+    if opportunities:
+        n = send_arb_alerts(bot, chat, opportunities)
+        logger.info(f"[Arb] {n} opportunity alert(s) sent.")
+    elif cfg["price_snapshot"]:
+        send_price_snapshot(bot, chat, all_prices)
+        logger.info("[Arb] No opportunities — price snapshot sent.")
+    else:
+        logger.info("[Arb] No profitable opportunities this cycle.")
 
 
 # ---------------------------------------------------------------------------
@@ -90,22 +122,27 @@ def run_check(config: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    config = load_config()
+    cfg = load_config()
 
-    print("[Monitor] DeFi Multi-Chain Monitor starting...")
-    print("[Monitor] Chains: Polygon, Arbitrum, Base")
-    print(f"[Monitor] Poll interval: {POLL_INTERVAL_SECONDS}s (set RUN_ONCE=true to run once)")
+    logger.info("DeFi Arbitrage Hunter starting...")
+    logger.info(f"Wallet : {cfg['wallet_address']}")
+    logger.info(f"DEXes  : Uniswap V3 (Polygon) | SushiSwap (Arbitrum) | PancakeSwap (Base)")
+    logger.info(f"Tokens : WETH, WBTC, LINK, GHO, USDe, MATIC")
+    logger.info(f"Min net profit: $10 USD  |  Trade size: $10,000  |  Flash-loan fee: 0.05%")
+    logger.info(f"Poll   : every {cfg['poll_interval']}s  (RUN_ONCE={cfg['run_once']})")
 
-    if config["run_once"]:
-        run_check(config)
-    else:
-        while True:
-            try:
-                run_check(config)
-            except Exception as exc:
-                print(f"[Monitor] Unexpected error: {exc}", file=sys.stderr)
-            print(f"[Monitor] Sleeping for {POLL_INTERVAL_SECONDS}s...")
-            time.sleep(POLL_INTERVAL_SECONDS)
+    if cfg["run_once"]:
+        run_cycle(cfg)
+        return
+
+    while True:
+        try:
+            run_cycle(cfg)
+        except Exception as exc:
+            logger.error(f"Cycle error: {exc}", exc_info=True)
+
+        logger.info(f"Sleeping {cfg['poll_interval']}s...")
+        time.sleep(cfg["poll_interval"])
 
 
 if __name__ == "__main__":
