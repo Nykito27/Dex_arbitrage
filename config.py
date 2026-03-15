@@ -56,6 +56,10 @@ DEXES = {
         # Uniswap V3 fee tiers in hundredths of a bip (500=0.05%, 3000=0.3%, 10000=1%)
         "fee_tiers": [500, 3000, 10000],
         "gas_units": 300_000,
+        # Uniswap V3 SwapRouter — handles exactInputSingle on Polygon
+        "router": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+        # Aave V3 PoolAddressesProvider on Polygon
+        "aave_addresses_provider": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
         "swap_url": (
             "https://app.uniswap.org/#/swap"
             "?chain=polygon&inputCurrency={token_in}&outputCurrency={token_out}"
@@ -76,6 +80,10 @@ DEXES = {
         # fee=100 (0.01%) is for stablecoins; try it last to avoid illiquid pools.
         "fee_tiers": [500, 3000, 100, 10000],
         "gas_units": 300_000,
+        # Uniswap V3 SwapRouter — also routes Uniswap-fallback pools on Arbitrum
+        "router": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+        # Aave V3 PoolAddressesProvider on Arbitrum
+        "aave_addresses_provider": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
         "swap_url": (
             "https://www.sushi.com/swap"
             "?chainId=42161&token0={token_in}&token1={token_out}"
@@ -94,6 +102,10 @@ DEXES = {
         # Try liquid tiers first (500, 2500, 3000), then stablecoin/dust tiers last.
         "fee_tiers": [500, 2500, 3000, 10000, 100],
         "gas_units": 300_000,
+        # Uniswap V3 SwapRouter — also routes Uniswap-fallback pools on Base
+        "router": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+        # Aave V3 PoolAddressesProvider on Base
+        "aave_addresses_provider": "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D",
         "swap_url": (
             "https://pancakeswap.finance/swap"
             "?chain=base&inputCurrency={token_in}&outputCurrency={token_out}"

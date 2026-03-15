@@ -316,17 +316,19 @@ def find_arbitrage_opportunities(all_prices: list[dict]) -> list[dict]:
         if net_profit > MIN_NET_PROFIT_USD:
             opportunities.append({
                 "symbol":           symbol,
-                "buy_dex":          buy_rec["dex"],
+                "buy_dex":          buy_rec["dex"],          # also used as dex_key
                 "buy_dex_name":     buy_rec["dex_name"],
                 "buy_chain":        buy_rec["chain"],
                 "buy_price":        buy_price,
+                "buy_fee":          buy_rec["fee_tier"],     # pool fee tier (e.g. 500)
                 "buy_url":          buy_rec["swap_url"],
                 "buy_pool":         buy_rec["pool_address"],
                 "buy_token_address": buy_rec["token_address"],
-                "sell_dex":         sell_rec["dex"],
+                "sell_dex":         sell_rec["dex"],         # also used as dex_key
                 "sell_dex_name":    sell_rec["dex_name"],
                 "sell_chain":       sell_rec["chain"],
                 "sell_price":       sell_price,
+                "sell_fee":         sell_rec["fee_tier"],    # pool fee tier
                 "sell_url":         sell_rec["swap_url"],
                 "sell_pool":        sell_rec["pool_address"],
                 "sell_token_address": sell_rec["token_address"],
