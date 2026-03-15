@@ -11,7 +11,7 @@ from web3 import Web3
 CHAINS = [
     {
         "name": "Polygon",
-        "rpc_url": "https://polygon-rpc.com",
+        "rpc_url": "https://polygon-bor-rpc.publicnode.com",
         "native_token": "MATIC",
         "low_balance_threshold": 10.0,
     },
