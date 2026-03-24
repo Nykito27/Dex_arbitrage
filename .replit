@@ -47,3 +47,9 @@ timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
+
+[userenv]
+
+[userenv.shared]
+EXECUTOR_CONTRACT_ADDRESS = "0xC06c4C7a4cA7DFD61d435cC0411D2789e2889E20"
+MANUAL_CONFIRM = "true"

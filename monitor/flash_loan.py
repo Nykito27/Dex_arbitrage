@@ -6,23 +6,32 @@ Flash Loan execution module.
 Responsibilities
 ----------------
 1. Store the latest optimal arbitrage route each scan cycle.
-2. Generate ABI-encoded calldata for FlashLoanExecutor.initiateArbitrage()
-   so the contract can be called without any manual translation.
-3. Expose a ready-to-broadcast transaction dict for every same-chain opportunity.
+2. Build the ABI-encoded ArbParams struct for FlashLoanExecutor.initiateArbitrage().
+3. Fire the transaction on-chain via web3.py with dynamic EIP-1559 gas pricing.
+4. Gate every execution attempt behind pre-flight validation and (optionally)
+   a manual Y/N confirmation prompt.
+
+Secrets required (add in Replit Secrets before firing live trades):
+  PRIVATE_KEY                — wallet private key (never hard-code)
+  EXECUTOR_CONTRACT_ADDRESS  — deployed FlashLoanExecutor.sol address
+
+Env vars (set automatically, or override in Replit Secrets):
+  MANUAL_CONFIRM  — "true" (default) = prompt Y/N before each trade
+                    "false"           = fire automatically when opportunity found
 
 Cross-chain note
 ----------------
 Flash loans require all steps (borrow → swap A → swap B → repay) to fit in a
 SINGLE Ethereum transaction on ONE chain.  Cross-chain gaps detected by the
-hunter are surfaced as alerts but the execution payload is only generated when
-both legs live on the same chain (same-chain arb, two different DEXes).
+hunter are surfaced as alerts but execution is only attempted for same-chain
+opportunities.
 """
 
 from __future__ import annotations
 import json
+import os
 import time
 import logging
-import math
 from typing import Optional
 from web3 import Web3
 
@@ -31,7 +40,16 @@ import config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# FlashLoanExecutor ABI  (only the functions we call)
+# Block-explorer base URLs (for printing tx links after broadcast)
+# ---------------------------------------------------------------------------
+EXPLORER = {
+    "Polygon":  "https://polygonscan.com/tx/",
+    "Arbitrum": "https://arbiscan.io/tx/",
+    "Base":     "https://basescan.org/tx/",
+}
+
+# ---------------------------------------------------------------------------
+# FlashLoanExecutor ABI  (only the two functions we call)
 # ---------------------------------------------------------------------------
 EXECUTOR_ABI = [
     {
@@ -75,16 +93,39 @@ EXECUTOR_ABI = [
 optimal_route: dict = {}
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _get_decimals(chain: str, symbol: str) -> int:
+    """Look up token decimals from config; default to 18."""
+    chain_tokens = config.TOKENS.get(chain, {})
+    token        = chain_tokens.get(symbol, {})
+    return token.get("decimals", 18)
+
+
+def _get_rpc_for_chain(chain: str) -> str:
+    """Return the RPC URL for the given chain name by scanning DEXES config."""
+    for dex_cfg in config.DEXES.values():
+        if dex_cfg.get("chain") == chain:
+            return dex_cfg["rpc_url"]
+    raise ValueError(f"No RPC URL found for chain '{chain}' in config.DEXES")
+
+
 def _build_execution_payload(opportunity: dict) -> Optional[dict]:
     """
-    Return the execution payload for same-chain opportunities, or None
-    if the two legs are on different chains (cannot be done atomically).
+    Build the execution payload for a single arbitrage opportunity.
 
-    The payload contains everything needed to call
-    FlashLoanExecutor.initiateArbitrage() on the target chain.
+    Returns a dict with:
+      executable   — True if both legs are on the same chain
+      arb_params   — the ArbParams struct values ready to pass to the contract
+      chain        — chain name (e.g. "Arbitrum")
+      human_readable — plain-English summary for the confirmation prompt
+
+    Returns None if the opportunity dict is missing required fields.
     """
-    buy_dex_key  = opportunity.get("buy_dex")   # e.g. "SushiSwap (Arbitrum)"
-    sell_dex_key = opportunity.get("sell_dex")  # e.g. "PancakeSwap (Base)"
+    buy_dex_key  = opportunity.get("buy_dex")
+    sell_dex_key = opportunity.get("sell_dex")
 
     if not buy_dex_key or not sell_dex_key:
         return None
@@ -95,14 +136,12 @@ def _build_execution_payload(opportunity: dict) -> Optional[dict]:
     buy_chain  = buy_cfg.get("chain")
     sell_chain = sell_cfg.get("chain")
 
-    # Flash loans only work single-chain
     if buy_chain != sell_chain:
         return {
             "executable": False,
             "reason": (
-                f"Cross-chain: buy on {buy_chain}, sell on {sell_chain}. "
-                "Cannot execute atomically. Consider bridging or waiting for "
-                "a same-chain opportunity."
+                f"Cross-chain gap: buy on {buy_chain}, sell on {sell_chain}. "
+                "Flash loans are single-chain only. Alert sent for awareness."
             ),
         }
 
@@ -111,73 +150,61 @@ def _build_execution_payload(opportunity: dict) -> Optional[dict]:
     router_b      = sell_cfg.get("router")
     aave_provider = buy_cfg.get("aave_addresses_provider")
 
-    token_in_address  = opportunity.get("buy_token_address")
-    token_out_address = opportunity.get("sell_token_address")
-    fee_a             = opportunity.get("buy_fee", 500)
-    fee_b             = opportunity.get("sell_fee", 500)
+    token_in_addr  = opportunity.get("buy_token_address")
+    token_out_addr = opportunity.get("sell_token_address")
+    fee_a          = opportunity.get("buy_fee",  500)
+    fee_b          = opportunity.get("sell_fee", 500)
 
-    decimals_in  = _get_decimals(chain, opportunity["symbol"])
-    loan_amount  = int(opportunity["token_amount"] * (10 ** decimals_in))
+    decimals_in = _get_decimals(chain, opportunity["symbol"])
+    loan_amount = int(opportunity["token_amount"] * (10 ** decimals_in))
 
-    # minProfit: 80% of estimated net profit as a floor (leaves room for slippage)
-    net_profit_usd  = opportunity["net_profit"]
-    token_price_usd = opportunity["buy_price"]
+    net_profit_usd   = opportunity["net_profit"]
+    token_price_usd  = opportunity["buy_price"]
     min_profit_token = (net_profit_usd * 0.80) / token_price_usd
     min_profit_wei   = int(min_profit_token * (10 ** decimals_in))
 
     return {
-        "executable":         True,
-        "chain":              chain,
+        "executable":              True,
+        "chain":                   chain,
         "aave_addresses_provider": aave_provider,
         "arb_params": {
             "routerA":    router_a,
             "routerB":    router_b,
-            "tokenIn":    token_in_address,
-            "tokenOut":   token_out_address,
+            "tokenIn":    token_in_addr,
+            "tokenOut":   token_out_addr,
             "feeA":       fee_a,
             "feeB":       fee_b,
             "loanAmount": loan_amount,
             "minProfit":  min_profit_wei,
         },
         "human_readable": {
-            "chain":               chain,
-            "token_symbol":        opportunity["symbol"],
-            "loan_amount_tokens":  opportunity["token_amount"],
-            "loan_amount_usd":     opportunity["trade_size_usd"],
-            "buy_dex":             opportunity["buy_dex"],
-            "sell_dex":            opportunity["sell_dex"],
-            "buy_price_usd":       opportunity["buy_price"],
-            "sell_price_usd":      opportunity["sell_price"],
-            "estimated_profit_usd": opportunity["net_profit"],
+            "chain":                chain,
+            "symbol":               opportunity["symbol"],
+            "loan_amount_tokens":   round(opportunity["token_amount"], 6),
+            "loan_amount_usd":      opportunity["trade_size_usd"],
+            "buy_dex":              buy_dex_key,
+            "buy_price_usd":        opportunity["buy_price"],
+            "sell_dex":             sell_dex_key,
+            "sell_price_usd":       opportunity["sell_price"],
+            "spread_pct":           opportunity["spread_pct"],
+            "gross_profit_usd":     opportunity["gross_profit"],
+            "flash_loan_fee_usd":   opportunity["flash_loan_fee"],
+            "gas_cost_usd":         opportunity["total_gas_usd"],
+            "estimated_profit_usd": net_profit_usd,
             "min_profit_floor_usd": net_profit_usd * 0.80,
         },
         "abi": EXECUTOR_ABI,
-        "deploy_note": (
-            f"Deploy FlashLoanExecutor.sol with constructor arg = {aave_provider} "
-            f"on {chain}, then call initiateArbitrage(arb_params)."
-        ),
     }
 
 
-def _get_decimals(chain: str, symbol: str) -> int:
-    """Look up token decimals from config; default to 18."""
-    chain_tokens = config.TOKENS.get(chain, {})
-    token        = chain_tokens.get(symbol, {})
-    return token.get("decimals", 18)
-
-
 # ---------------------------------------------------------------------------
-# Public API
+# Public route storage API
 # ---------------------------------------------------------------------------
 
 def store_optimal_route(opportunity: dict | None) -> None:
     """
-    Persist the best arbitrage opportunity found in the current cycle.
-
-    Parameters
-    ----------
-    opportunity : dict from price_hunter.find_arbitrage_opportunities(),
-                  or None if no profitable route was found.
+    Called by the main loop every scan cycle.
+    Persists the best opportunity and its execution payload.
     """
     global optimal_route
 
@@ -186,15 +213,15 @@ def store_optimal_route(opportunity: dict | None) -> None:
         return
 
     payload = _build_execution_payload(opportunity)
+    executable = payload.get("executable") if payload else False
 
     optimal_route = {
-        "status":           "ready",
-        "updated_at":       time.time(),
-        "symbol":           opportunity["symbol"],
-        "trade_size_usd":   opportunity["trade_size_usd"],
-        "token_amount":     opportunity["token_amount"],
-        "estimated_net_profit_usd": opportunity["net_profit"],
-
+        "status":     "ready",
+        "updated_at": time.time(),
+        "symbol":     opportunity["symbol"],
+        "trade_size_usd":            opportunity["trade_size_usd"],
+        "token_amount":              opportunity["token_amount"],
+        "estimated_net_profit_usd":  opportunity["net_profit"],
         "buy": {
             "dex":           opportunity["buy_dex"],
             "chain":         opportunity["buy_chain"],
@@ -211,11 +238,9 @@ def store_optimal_route(opportunity: dict | None) -> None:
             "token_address": opportunity["sell_token_address"],
             "swap_url":      opportunity["sell_url"],
         },
-
         "execution": payload,
     }
 
-    executable = payload.get("executable") if payload else False
     logger.info(
         f"[FlashLoan] Optimal route stored: "
         f"{opportunity['symbol']} | "
@@ -237,64 +262,124 @@ def dump_optimal_route_json() -> str:
 
 
 # ---------------------------------------------------------------------------
-# FlashLoanExecutor — web3 transaction builder
+# FlashLoanExecutor — on-chain transaction builder and broadcaster
 # ---------------------------------------------------------------------------
 
 class FlashLoanExecutor:
     """
-    Builds and optionally broadcasts the initiateArbitrage() transaction.
+    Builds, validates, and fires the initiateArbitrage() transaction.
 
-    Usage example
-    -------------
-    executor = FlashLoanExecutor(
-        rpc_url="https://arb1.arbitrum.io/rpc",
-        contract_address="0xYourDeployedContract",
-        private_key=os.getenv("PRIVATE_KEY"),
-    )
-    route = get_optimal_route()
-    if route.get("execution", {}).get("executable"):
-        tx_hash = executor.fire(route["execution"])
-        print("tx:", tx_hash)
+    Instantiate once at startup; call fire() when ready to execute.
     """
 
     def __init__(self,
-                 rpc_url:          str,
                  contract_address: str,
                  private_key:      str | None = None):
-        """
-        Parameters
-        ----------
-        rpc_url:           RPC endpoint (must match the chain in the route).
-        contract_address:  Deployed FlashLoanExecutor.sol address.
-        private_key:       Wallet private key — store as a Replit Secret only.
-        """
-        self.w3               = Web3(Web3.HTTPProvider(rpc_url))
-        self.contract_address = Web3.to_checksum_address(contract_address)
-        self.private_key      = private_key
+        self.contract_address = (contract_address or "").strip()
+        self.private_key      = (private_key      or "").strip()
 
-        self.contract = self.w3.eth.contract(
-            address=self.contract_address,
-            abi=EXECUTOR_ABI,
-        )
+    # ------------------------------------------------------------------
+    # Pre-flight validation
+    # ------------------------------------------------------------------
 
+    def validate_ready(self) -> tuple[bool, str]:
+        """
+        Check that the executor is fully configured before touching real money.
+
+        Returns (True, "OK") or (False, "<reason>").
+        """
+        if not self.contract_address:
+            return False, (
+                "EXECUTOR_CONTRACT_ADDRESS is not set. "
+                "Add it in Replit Secrets (Secrets tab)."
+            )
+        try:
+            Web3.to_checksum_address(self.contract_address)
+        except Exception:
+            return False, (
+                f"EXECUTOR_CONTRACT_ADDRESS '{self.contract_address}' "
+                "is not a valid EVM address."
+            )
+        if not self.private_key:
+            return False, (
+                "PRIVATE_KEY is not set. "
+                "Add your wallet private key in Replit Secrets."
+            )
+        if len(self.private_key) not in (64, 66):
+            return False, (
+                "PRIVATE_KEY looks malformed (expected 64 hex chars or 0x-prefixed 66)."
+            )
+        return True, "OK"
+
+    # ------------------------------------------------------------------
+    # Dynamic gas pricing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_gas_params(w3: Web3) -> dict:
+        """
+        Return EIP-1559 gas params when the chain supports them,
+        otherwise fall back to a legacy gasPrice with a 20% buffer.
+
+        EIP-1559 formula:
+          maxPriorityFeePerGas = suggested tip from node
+          maxFeePerGas         = (2 × baseFee) + tip
+          — the 2× multiplier means the tx still lands even if the next
+            two blocks double the base fee (very safe margin).
+        """
+        try:
+            block    = w3.eth.get_block("latest")
+            base_fee = block.get("baseFeePerGas")
+
+            if base_fee is not None:
+                tip = w3.eth.max_priority_fee          # node's suggested tip
+                max_fee = (2 * base_fee) + tip
+                logger.debug(
+                    f"[Gas] EIP-1559: baseFee={base_fee} tip={tip} maxFee={max_fee}"
+                )
+                return {
+                    "maxPriorityFeePerGas": tip,
+                    "maxFeePerGas":         max_fee,
+                }
+        except Exception as e:
+            logger.debug(f"[Gas] EIP-1559 fetch failed ({e}), falling back to legacy")
+
+        # Legacy fallback (+20% buffer so the tx is competitive)
+        gas_price = w3.eth.gas_price
+        buffered  = int(gas_price * 1.20)
+        logger.debug(f"[Gas] Legacy: gasPrice={gas_price} (+20% → {buffered})")
+        return {"gasPrice": buffered}
+
+    # ------------------------------------------------------------------
+    # Transaction builder
     # ------------------------------------------------------------------
 
     def build_tx(self, execution_payload: dict) -> dict:
         """
-        Encode the initiateArbitrage() call into an unsigned transaction dict.
+        Encode initiateArbitrage() into an unsigned transaction dict.
 
         Parameters
         ----------
-        execution_payload : the 'execution' key from optimal_route.
+        execution_payload : the 'execution' key from optimal_route
 
         Returns
         -------
-        Unsigned tx dict ready for sign_transaction / eth_sendRawTransaction.
+        Unsigned tx dict — ready for sign_transaction / eth_sendRawTransaction.
         """
         if not execution_payload.get("executable"):
             raise ValueError(
-                "Cannot build tx: " + execution_payload.get("reason", "not executable")
+                "Cannot build tx: "
+                + execution_payload.get("reason", "opportunity is not executable")
             )
+
+        chain   = execution_payload["chain"]
+        rpc_url = _get_rpc_for_chain(chain)
+        w3      = Web3(Web3.HTTPProvider(rpc_url))
+
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(self.contract_address),
+            abi=EXECUTOR_ABI,
+        )
 
         params = execution_payload["arb_params"]
         arb_tuple = (
@@ -308,31 +393,65 @@ class FlashLoanExecutor:
             int(params["minProfit"]),
         )
 
-        caller = self.w3.eth.account.from_key(self.private_key).address
-        nonce  = self.w3.eth.get_transaction_count(caller)
+        caller = w3.eth.account.from_key(self.private_key).address
+        nonce  = w3.eth.get_transaction_count(caller, "pending")
 
-        tx = self.contract.functions.initiateArbitrage(arb_tuple).build_transaction({
+        gas_params = self._build_gas_params(w3)
+
+        tx = contract.functions.initiateArbitrage(arb_tuple).build_transaction({
             "from":  caller,
             "nonce": nonce,
-            "gas":   800_000,
-            "gasPrice": self.w3.eth.gas_price,
+            "gas":   900_000,          # generous ceiling — unused gas is refunded
+            **gas_params,
         })
-        return tx
+        return tx, w3
 
-    def fire(self, execution_payload: dict) -> str:
+    # ------------------------------------------------------------------
+    # Broadcaster
+    # ------------------------------------------------------------------
+
+    def fire(self, execution_payload: dict) -> dict:
         """
-        Sign and broadcast initiateArbitrage().
+        Validate, sign, and broadcast initiateArbitrage().
 
         Returns
         -------
-        Transaction hash (hex string).
+        {
+          "tx_hash":      "0x...",
+          "explorer_url": "https://arbiscan.io/tx/0x...",
+          "chain":        "Arbitrum",
+        }
+        Raises RuntimeError / ValueError on any pre-flight failure.
         """
-        if not self.private_key:
-            raise RuntimeError(
-                "No private key set — add PRIVATE_KEY as a Replit Secret."
+        # ── 1. Pre-flight checks ─────────────────────────────────────────────
+        ready, reason = self.validate_ready()
+        if not ready:
+            raise RuntimeError(f"[FlashLoan] Pre-flight FAILED: {reason}")
+
+        if not execution_payload.get("executable"):
+            raise ValueError(
+                "[FlashLoan] Opportunity is not executable: "
+                + execution_payload.get("reason", "unknown reason")
             )
 
-        tx     = self.build_tx(execution_payload)
-        signed = self.w3.eth.account.sign_transaction(tx, self.private_key)
-        tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        return tx_hash.hex()
+        # ── 2. Build tx ──────────────────────────────────────────────────────
+        chain   = execution_payload["chain"]
+        tx, w3  = self.build_tx(execution_payload)
+
+        # ── 3. Sign ──────────────────────────────────────────────────────────
+        signed = w3.eth.account.sign_transaction(tx, self.private_key)
+
+        # ── 4. Broadcast ─────────────────────────────────────────────────────
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+
+        explorer_base = EXPLORER.get(chain, "")
+        explorer_url  = f"{explorer_base}{tx_hash}" if explorer_base else tx_hash
+
+        logger.info(f"[FlashLoan] Transaction broadcast! hash={tx_hash}")
+        logger.info(f"[FlashLoan] Track it: {explorer_url}")
+
+        return {
+            "tx_hash":      tx_hash,
+            "explorer_url": explorer_url,
+            "chain":        chain,
+        }
