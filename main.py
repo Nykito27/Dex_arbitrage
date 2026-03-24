@@ -1,33 +1,32 @@
 """
 main.py
 -------
-DeFi High-Frequency Multi-Chain Arbitrage Hunter
+DeFi High-Frequency Multi-Chain Arbitrage Hunter — 100% Autonomous Mode
 
 Each cycle:
   1. Checks native-token wallet balances on Polygon, Arbitrum, Base.
-  2. Scans Uniswap V3 (Polygon), SushiSwap (Arbitrum), PancakeSwap (Base)
-     for every token in the watchlist.
+  2. Scans all DEXes for every token in the watchlist.
   3. Calculates net profit after gas fees and flash-loan fee (0.05%).
-  4. Sends a Telegram alert for any opportunity with net profit > $10 USD,
-     including direct DEX swap links.
-  5. Stores the best route and (if EXECUTOR_CONTRACT_ADDRESS + PRIVATE_KEY are
-     set) prompts Y/N confirmation before firing the flash-loan transaction.
+  4. Sends a Telegram alert for same-chain opportunities > $10.
+  5. Auto-fires initiateArbitrage() on the FlashLoanExecutor contract
+     without waiting for manual Y/N confirmation.
+  6. On tx revert: logs the error to trade_history.log and puts the
+     token pair on a 5-minute cooldown before retrying.
+  7. Sends a 4-hour rolling summary to Telegram.
+  8. Serves /health on port 8080 for external uptime monitors.
 
-Required Replit Secrets:
-  WALLET_ADDRESS            — EVM wallet to monitor balances on
+Required Replit Secrets (all read via os.getenv):
+  WALLET_ADDRESS            — EVM wallet to monitor balances
   TELEGRAM_BOT_TOKEN        — from Telegram @BotFather
   TELEGRAM_CHAT_ID          — target chat for alerts
-
-Execution Secrets (add when ready to go live):
-  EXECUTOR_CONTRACT_ADDRESS — deployed FlashLoanExecutor.sol address
   PRIVATE_KEY               — wallet private key that owns the contract
+  EXECUTOR_CONTRACT_ADDRESS — deployed FlashLoanExecutor.sol address
 
 Optional env vars:
-  MANUAL_CONFIRM  — "true" (default) = Y/N prompt before each trade
-                    "false"          = fire automatically (use with caution)
   RUN_ONCE        — "true" → single pass then exit
-  POLL_INTERVAL   — seconds between scans (default: 60)
-  PRICE_SNAPSHOT  — "true" → send full price table even with no arb
+  POLL_INTERVAL   — seconds between scans (default 60)
+  PRICE_SNAPSHOT  — "true" → send full price table when no arb found
+  KEEPALIVE_PORT  — port for the Flask keep-alive server (default 8080)
 """
 
 from __future__ import annotations
@@ -42,8 +41,16 @@ from monitor import (
     send_telegram_report,
     send_arb_alerts,
     send_price_snapshot,
+    send_trade_executed,
+    send_4h_summary,
     scan_all_dexes,
     store_optimal_route,
+    is_on_cooldown,
+    cooldown_remaining,
+    log_attempt,
+    log_success,
+    log_failure,
+    start_keepalive_server,
 )
 from monitor.flash_loan import FlashLoanExecutor, get_optimal_route
 
@@ -55,21 +62,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config loader
+# Config loader — all values from os.getenv / Replit Secrets
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_config() -> dict:
     cfg = {
-        "wallet_address":     os.environ.get("WALLET_ADDRESS", "").strip(),
-        "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
-        "telegram_chat_id":   os.environ.get("TELEGRAM_CHAT_ID", "").strip(),
-        "run_once":           os.environ.get("RUN_ONCE",  "false").lower() == "true",
-        "poll_interval":      int(os.environ.get("POLL_INTERVAL", "60")),
-        "price_snapshot":     os.environ.get("PRICE_SNAPSHOT", "false").lower() == "true",
-        # Execution settings
-        "executor_address":   os.environ.get("EXECUTOR_CONTRACT_ADDRESS", "").strip(),
-        "private_key":        os.environ.get("PRIVATE_KEY", "").strip(),
-        "manual_confirm":     os.environ.get("MANUAL_CONFIRM", "true").lower() == "true",
+        "wallet_address":     os.getenv("WALLET_ADDRESS",            "").strip(),
+        "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN",        "").strip(),
+        "telegram_chat_id":   os.getenv("TELEGRAM_CHAT_ID",          "").strip(),
+        "executor_address":   os.getenv("EXECUTOR_CONTRACT_ADDRESS",  "").strip(),
+        "private_key":        os.getenv("PRIVATE_KEY",                "").strip(),
+        "run_once":           os.getenv("RUN_ONCE",      "false").lower() == "true",
+        "poll_interval":      int(os.getenv("POLL_INTERVAL", "60")),
+        "price_snapshot":     os.getenv("PRICE_SNAPSHOT","false").lower() == "true",
+        "keepalive_port":     int(os.getenv("KEEPALIVE_PORT", "8080")),
     }
 
     missing = [k for k, v in {
@@ -81,7 +87,7 @@ def load_config() -> dict:
     if missing:
         print(
             f"[ERROR] Missing required secret(s): {', '.join(missing)}\n"
-            "Add them in Replit → Secrets and restart.",
+            "Add them under Replit → Secrets and restart.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -90,142 +96,161 @@ def load_config() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Execution logic  (validation → confirmation → fire)
+# Global stats — shared with Flask /status endpoint and 4h summary
+# ─────────────────────────────────────────────────────────────────────────────
+
+_bot_start_time = time.time()
+
+stats: dict = {
+    "cycles_run":            0,
+    "same_chain_found":      0,
+    "cross_chain_filtered":  0,
+    "trades_attempted":      0,
+    "trades_succeeded":      0,
+    "trades_failed":         0,
+    "total_est_profit_usd":  0.0,
+    "last_summary_sent_at":  time.time(),
+}
+
+SUMMARY_INTERVAL_SECS = 4 * 3600   # 4 hours
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autonomous execution — no Y/N prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
 SEPARATOR = "=" * 62
 
 
-def _print_trade_summary(payload: dict) -> None:
-    """Print a formatted trade summary before asking for confirmation."""
-    hr  = payload["human_readable"]
-    ap  = payload["arb_params"]
-
-    print(f"\n{SEPARATOR}")
-    print("  *** FLASH LOAN OPPORTUNITY DETECTED ***")
-    print(SEPARATOR)
-    print(f"  Chain          : {hr['chain']}")
-    print(f"  Token          : {hr['symbol']}")
-    print(f"  Loan size      : {hr['loan_amount_tokens']} {hr['symbol']}  "
-          f"(${hr['loan_amount_usd']:,.2f})")
-    print(f"  Buy on         : {hr['buy_dex']}  @ ${hr['buy_price_usd']:,.4f}")
-    print(f"  Sell on        : {hr['sell_dex']} @ ${hr['sell_price_usd']:,.4f}")
-    print(f"  Spread         : {hr['spread_pct']:.3f}%")
-    print(f"  Gross profit   : ${hr['gross_profit_usd']:,.2f}")
-    print(f"  Flash-loan fee : ${hr['flash_loan_fee_usd']:,.2f}")
-    print(f"  Gas cost       : ${hr['gas_cost_usd']:,.4f}")
-    print(f"  NET PROFIT EST : ${hr['estimated_profit_usd']:,.2f}")
-    print(f"  Min-profit floor: ${hr['min_profit_floor_usd']:,.2f}  "
-          "(tx reverts if missed)")
-    print(SEPARATOR)
-    print("  ArbParams for contract:")
-    print(f"    routerA   : {ap['routerA']}")
-    print(f"    routerB   : {ap['routerB']}")
-    print(f"    tokenIn   : {ap['tokenIn']}")
-    print(f"    tokenOut  : {ap['tokenOut']}")
-    print(f"    feeA      : {ap['feeA']}   feeB: {ap['feeB']}")
-    print(f"    loanAmount: {ap['loanAmount']} wei")
-    print(f"    minProfit : {ap['minProfit']} wei")
-    print(SEPARATOR)
-
-
-def _ask_confirmation() -> bool:
+def execute_trade(cfg: dict, opportunity: dict) -> None:
     """
-    Prompt Y/N in the terminal.
-    Returns True if user typed 'y' / 'yes', False otherwise.
-    Falls back to False (safe) when stdin is not a tty (non-interactive).
-    """
-    if not sys.stdin.isatty():
-        logger.warning(
-            "[Confirm] stdin is not a terminal — skipping execution. "
-            "Set MANUAL_CONFIRM=false to auto-fire, or run interactively."
-        )
-        return False
-
-    try:
-        answer = input("\n  Execute Flash Loan? (Y/N) : ").strip().lower()
-        return answer in ("y", "yes")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-
-
-def maybe_execute_trade(cfg: dict) -> None:
-    """
-    Called after every scan cycle.
+    Auto-fire initiateArbitrage() for a same-chain opportunity.
 
     Steps:
-      1. Check that executor address and private key are configured.
-      2. Retrieve latest optimal route; skip if not executable.
-      3. In MANUAL_CONFIRM mode: print trade details and ask Y/N.
-      4. Fire the transaction; print tx hash + explorer link.
+      1. Check pair cooldown (skip if recently failed).
+      2. Pre-flight validate executor config.
+      3. Retrieve and verify the stored execution payload.
+      4. Log the attempt.
+      5. Build, sign, and broadcast the transaction.
+      6. On success: log + Telegram notification.
+      7. On failure: log error + set pair cooldown.
     """
     executor_address = cfg["executor_address"]
     private_key      = cfg["private_key"]
 
-    # ── Validation check — both must be present ──────────────────────────────
-    if not executor_address:
+    if not executor_address or not private_key:
         logger.debug(
-            "[Executor] EXECUTOR_CONTRACT_ADDRESS not set — "
-            "monitoring only, no trades will fire."
-        )
-        return
-    if not private_key:
-        logger.warning(
-            "[Executor] EXECUTOR_CONTRACT_ADDRESS is set but PRIVATE_KEY is missing. "
-            "Add PRIVATE_KEY in Replit Secrets to enable live trading."
+            "[Executor] Skipping — EXECUTOR_CONTRACT_ADDRESS or PRIVATE_KEY not set."
         )
         return
 
-    # ── Check executor pre-flight (address format, key length) ───────────────
+    symbol   = opportunity["symbol"]
+    buy_dex  = opportunity["buy_dex"]
+    sell_dex = opportunity["sell_dex"]
+    chain    = opportunity["buy_chain"]
+
+    # ── Cooldown gate ────────────────────────────────────────────────────────
+    if is_on_cooldown(symbol, buy_dex, sell_dex):
+        rem = cooldown_remaining(symbol, buy_dex, sell_dex)
+        logger.info(
+            f"[Executor] {symbol} ({buy_dex}→{sell_dex}) on cooldown "
+            f"— {rem:.0f}s remaining. Skipping."
+        )
+        return
+
+    # ── Pre-flight ───────────────────────────────────────────────────────────
     executor = FlashLoanExecutor(
         contract_address=executor_address,
         private_key=private_key,
     )
     ready, reason = executor.validate_ready()
     if not ready:
-        logger.error(f"[Executor] Pre-flight check failed: {reason}")
+        logger.error(f"[Executor] Pre-flight failed: {reason}")
         return
 
-    # ── Get the latest stored opportunity ────────────────────────────────────
+    # ── Check stored payload ─────────────────────────────────────────────────
     route = get_optimal_route()
     if route.get("status") != "ready":
         return
 
     execution = route.get("execution", {})
     if not execution or not execution.get("executable"):
-        reason = execution.get("reason", "no executable payload") if execution else "none"
-        logger.debug(f"[Executor] Opportunity not executable: {reason}")
+        logger.debug(
+            "[Executor] Stored route not executable: "
+            + (execution.get("reason", "none") if execution else "no payload")
+        )
         return
 
-    # ── Manual confirmation gate ──────────────────────────────────────────────
-    if cfg["manual_confirm"]:
-        _print_trade_summary(execution)
-        confirmed = _ask_confirmation()
-        if not confirmed:
-            print("  [Executor] Trade skipped.\n")
-            logger.info("[Executor] User declined — trade skipped.")
-            return
-        print("  [Executor] Confirmed — broadcasting transaction...\n")
-    else:
-        hr = execution["human_readable"]
-        logger.info(
-            f"[Executor] Auto-firing: {hr['symbol']} "
-            f"${hr['estimated_profit_usd']:,.2f} net profit on {hr['chain']}"
-        )
+    hr  = execution["human_readable"]
+    est = hr["estimated_profit_usd"]
+
+    # ── Log attempt ──────────────────────────────────────────────────────────
+    log_attempt(symbol, chain, buy_dex, sell_dex, est)
+    stats["trades_attempted"] += 1
+
+    logger.info(
+        f"[Executor] AUTO-FIRING {symbol} on {chain} | "
+        f"buy {buy_dex} → sell {sell_dex} | "
+        f"est net ${est:,.2f}"
+    )
 
     # ── Fire ─────────────────────────────────────────────────────────────────
     try:
         result = executor.fire(execution)
+        tx_hash      = result["tx_hash"]
+        explorer_url = result["explorer_url"]
+
+        stats["trades_succeeded"]      += 1
+        stats["total_est_profit_usd"]  += est
+
+        log_success(symbol, chain, buy_dex, sell_dex, tx_hash, explorer_url, est)
+
+        logger.info(f"[Executor] ✅ Broadcast! tx={tx_hash}")
+        logger.info(f"[Executor]    Track: {explorer_url}")
         print(f"\n{SEPARATOR}")
-        print("  *** TRANSACTION BROADCAST ***")
-        print(f"  Chain   : {result['chain']}")
-        print(f"  Tx Hash : {result['tx_hash']}")
-        print(f"  Track   : {result['explorer_url']}")
+        print(f"  *** TRADE BROADCAST ***")
+        print(f"  Chain    : {chain}")
+        print(f"  Symbol   : {symbol}")
+        print(f"  Est. Net : ${est:,.2f}")
+        print(f"  Tx Hash  : {tx_hash}")
+        print(f"  Explorer : {explorer_url}")
         print(f"{SEPARATOR}\n")
-        logger.info(f"[Executor] Fired! tx={result['tx_hash']}")
+
+        send_trade_executed(
+            cfg["telegram_bot_token"],
+            cfg["telegram_chat_id"],
+            symbol=symbol,
+            chain=chain,
+            estimated_profit_usd=est,
+            tx_hash=tx_hash,
+            explorer_url=explorer_url,
+        )
+
     except Exception as exc:
-        logger.error(f"[Executor] Transaction failed: {exc}", exc_info=True)
+        stats["trades_failed"] += 1
+        log_failure(symbol, chain, buy_dex, sell_dex, str(exc), est)
+        logger.error(f"[Executor] ❌ Transaction failed: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4-hour summary sender
+# ─────────────────────────────────────────────────────────────────────────────
+
+def maybe_send_summary(cfg: dict) -> None:
+    """Send the 4-hour rolling summary if it's time."""
+    if time.time() - stats["last_summary_sent_at"] < SUMMARY_INTERVAL_SECS:
+        return
+
+    uptime_h = (time.time() - _bot_start_time) / 3600
+    summary_stats = {**stats, "uptime_hours": uptime_h}
+
+    send_4h_summary(
+        cfg["telegram_bot_token"],
+        cfg["telegram_chat_id"],
+        summary_stats,
+    )
+    logger.info("[Summary] 4-hour summary sent to Telegram.")
+    stats["last_summary_sent_at"] = time.time()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,36 +269,41 @@ def run_cycle(cfg: dict) -> None:
             logger.warning(f"  [{r['name']}] ERROR: {r['error']}")
         else:
             flag = " *** LOW ***" if r["is_low"] else ""
-            logger.info(f"  [{r['name']}] {r['balance']:.6f} {r['native_token']}{flag}")
+            logger.info(
+                f"  [{r['name']}] {r['balance']:.6f} {r['native_token']}{flag}"
+            )
     send_telegram_report(bot, chat, balance_results)
 
     # ── 2. Price scan ─────────────────────────────────────────────────────────
     logger.info("=== Price scan across DEXes ===")
     all_prices, opportunities = scan_all_dexes()
+    stats["cycles_run"] += 1
 
     # ── 3. Split same-chain vs cross-chain ───────────────────────────────────
     same_chain  = [o for o in opportunities if o["buy_chain"] == o["sell_chain"]]
     cross_chain = [o for o in opportunities if o["buy_chain"] != o["sell_chain"]]
 
-    if cross_chain:
-        for o in cross_chain:
-            logger.debug(
-                f"[Arb] Cross-chain gap skipped "
-                f"({o['symbol']} {o['buy_chain']}→{o['sell_chain']} "
-                f"${o['net_profit']:,.2f}) — not alertable."
-            )
+    stats["same_chain_found"]     += len(same_chain)
+    stats["cross_chain_filtered"] += len(cross_chain)
 
-    # ── 4. Store best SAME-CHAIN route for executor ───────────────────────────
+    for o in cross_chain:
+        logger.debug(
+            f"[Arb] Cross-chain gap dropped: "
+            f"{o['symbol']} {o['buy_chain']}→{o['sell_chain']} "
+            f"net=${o['net_profit']:,.2f}"
+        )
+
+    # ── 4. Store best same-chain route for executor ───────────────────────────
     best = same_chain[0] if same_chain else None
     store_optimal_route(best)
 
-    # ── 5. Telegram alerts — same-chain only ──────────────────────────────────
+    # ── 5. Telegram alerts — same-chain only ─────────────────────────────────
     if same_chain:
         n = send_arb_alerts(bot, chat, same_chain)
         logger.info(f"[Arb] {n} same-chain alert(s) sent.")
     elif cross_chain:
         logger.info(
-            f"[Arb] {len(cross_chain)} cross-chain gap(s) found but filtered "
+            f"[Arb] {len(cross_chain)} cross-chain gap(s) filtered "
             "(same-chain only mode). No alerts sent."
         )
     elif cfg["price_snapshot"]:
@@ -282,8 +312,12 @@ def run_cycle(cfg: dict) -> None:
     else:
         logger.info("[Arb] No profitable opportunities this cycle.")
 
-    # ── 6. Execution gate — same-chain only (fires only if secrets set + confirmed)
-    maybe_execute_trade(cfg)
+    # ── 6. Auto-execute best same-chain opportunity ───────────────────────────
+    if best:
+        execute_trade(cfg, best)
+
+    # ── 7. 4-hour summary check ───────────────────────────────────────────────
+    maybe_send_summary(cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,22 +327,29 @@ def run_cycle(cfg: dict) -> None:
 def main() -> None:
     cfg = load_config()
 
-    exec_configured = bool(cfg["executor_address"])
-    exec_mode = (
-        "MANUAL CONFIRM" if cfg["manual_confirm"] else "AUTO-FIRE"
-    ) if exec_configured else "monitor-only (add PRIVATE_KEY to enable trading)"
+    exec_configured = bool(cfg["executor_address"] and cfg["private_key"])
+    exec_mode = "AUTO-FIRE (autonomous)" if exec_configured else (
+        "monitor-only (add PRIVATE_KEY + EXECUTOR_CONTRACT_ADDRESS to enable trading)"
+    )
 
-    logger.info("DeFi Arbitrage Hunter starting...")
-    logger.info(f"Wallet   : {cfg['wallet_address']}")
-    logger.info("DEXes    : Polygon  → Uniswap V3  ↔  SushiSwap V3")
-    logger.info("           Arbitrum → Uniswap V3  ↔  SushiSwap V3")
-    logger.info("           Base     → Uniswap V3  ↔  PancakeSwap V3")
-    logger.info(f"Tokens   : {len(__import__('config').WATCHLIST)} symbols monitored")
-    logger.info("Alerts   : Same-chain only (cross-chain gaps silently dropped)")
-    logger.info(f"Min profit: $10 USD  |  Trade size: $10,000  |  Flash-loan fee: 0.05%")
-    logger.info(f"Executor : {cfg['executor_address'] or 'NOT SET'}")
-    logger.info(f"Mode     : {exec_mode}")
-    logger.info(f"Poll     : every {cfg['poll_interval']}s  (RUN_ONCE={cfg['run_once']})")
+    # ── Start Flask keep-alive server ────────────────────────────────────────
+    start_keepalive_server(port=cfg["keepalive_port"], stats=stats)
+
+    # ── Startup banner ───────────────────────────────────────────────────────
+    logger.info("DeFi Arbitrage Hunter — 100% Autonomous Mode")
+    logger.info(f"Wallet    : {cfg['wallet_address']}")
+    logger.info("DEXes     : Polygon  → Uniswap V3  ↔  SushiSwap V3")
+    logger.info("            Arbitrum → Uniswap V3  ↔  SushiSwap V3")
+    logger.info("            Base     → Uniswap V3  ↔  PancakeSwap V3")
+    logger.info(f"Tokens    : {len(__import__('config').WATCHLIST)} symbols")
+    logger.info("Alerts    : Same-chain only — cross-chain gaps silently dropped")
+    logger.info(f"Min profit: $10 USD  |  Trade size: $10,000  |  FL fee: 0.05%")
+    logger.info(f"Executor  : {cfg['executor_address'] or 'NOT SET'}")
+    logger.info(f"Mode      : {exec_mode}")
+    logger.info(f"KeepAlive : http://0.0.0.0:{cfg['keepalive_port']}/health")
+    logger.info(f"Summary   : every 4h via Telegram")
+    logger.info(f"Cooldown  : 5m per pair after revert")
+    logger.info(f"Poll      : every {cfg['poll_interval']}s  (RUN_ONCE={cfg['run_once']})")
 
     if cfg["run_once"]:
         run_cycle(cfg)

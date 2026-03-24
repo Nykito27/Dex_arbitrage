@@ -150,6 +150,83 @@ def send_arb_alerts(bot_token: str, chat_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Trade executed notification
+# ---------------------------------------------------------------------------
+
+def send_trade_executed(bot_token: str, chat_id: str,
+                        symbol: str, chain: str,
+                        estimated_profit_usd: float,
+                        tx_hash: str, explorer_url: str) -> None:
+    """Send a notification immediately after a flash-loan trade is broadcast."""
+    msg = (
+        f"*⚡ TRADE EXECUTED*\n"
+        f"\n"
+        f"*Chain:*   {chain}\n"
+        f"*Token:*   {symbol}/USDC\n"
+        f"*Est. Net Profit:* `${estimated_profit_usd:,.2f}`\n"
+        f"\n"
+        f"*Tx Hash:*\n`{tx_hash}`\n"
+        f"\n"
+        f"[View on Block Explorer ↗]({explorer_url})"
+    )
+    try:
+        _send(bot_token, chat_id, msg)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[Telegram] Execution notification failed: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4-hour rolling summary
+# ---------------------------------------------------------------------------
+
+def send_4h_summary(bot_token: str, chat_id: str, stats: dict) -> None:
+    """
+    Send a 4-hour summary of scanner activity.
+
+    Expected keys in stats:
+      cycles_run, same_chain_found, cross_chain_filtered,
+      trades_attempted, trades_succeeded, trades_failed,
+      total_est_profit_usd, uptime_hours
+    """
+    cycles          = stats.get("cycles_run", 0)
+    same_chain      = stats.get("same_chain_found", 0)
+    cross_chain     = stats.get("cross_chain_filtered", 0)
+    attempted       = stats.get("trades_attempted", 0)
+    succeeded       = stats.get("trades_succeeded", 0)
+    failed          = stats.get("trades_failed", 0)
+    est_profit      = stats.get("total_est_profit_usd", 0.0)
+    uptime_h        = stats.get("uptime_hours", 0.0)
+
+    msg = (
+        f"*📊 4-Hour Activity Summary*\n"
+        f"\n"
+        f"*Uptime:*            {uptime_h:.1f}h\n"
+        f"*Scan cycles:*       {cycles}\n"
+        f"\n"
+        f"*Same-chain opps:*   {same_chain}\n"
+        f"*Cross-chain gaps:*  {cross_chain} _(filtered)_\n"
+        f"\n"
+        f"*Trades attempted:*  {attempted}\n"
+        f"  ✅ Succeeded:      {succeeded}\n"
+        f"  ❌ Failed/reverted: {failed}\n"
+        f"\n"
+        f"*Total est. profit:* `${est_profit:,.2f}`\n"
+        f"\n"
+        f"_Next summary in 4h._"
+    )
+    try:
+        _send(bot_token, chat_id, msg)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[Telegram] 4h summary failed: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Price snapshot (sent when no opportunities found)
 # ---------------------------------------------------------------------------
 
