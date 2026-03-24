@@ -75,7 +75,20 @@ _POOL_ABI = [
     },
 ]
 
+_ERC20_BALANCE_ABI = [
+    {
+        "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
 _NULL_ADDR = "0x0000000000000000000000000000000000000000"
+
+# Pools with less than this much USDC are considered stale / garbage-priced
+_MIN_POOL_USDC_RAW_1000 = 1_000  # USD — checked via USDC.balanceOf(pool)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +146,24 @@ def _get_pool_price_usd(w3: Web3,
                     continue
 
                 pool = w3.eth.contract(address=pool_addr, abi=_POOL_ABI)
+
+                # Liquidity gate: skip pools with < $1,000 USDC reserve
+                # (catches stale/abandoned pools that give garbage prices)
+                try:
+                    usdc_contract = w3.eth.contract(
+                        address=addr_usdc, abi=_ERC20_BALANCE_ABI
+                    )
+                    usdc_balance_raw = usdc_contract.functions.balanceOf(pool_addr).call()
+                    usdc_balance_usd = usdc_balance_raw / (10 ** usdc["decimals"])
+                    if usdc_balance_usd < _MIN_POOL_USDC_RAW_1000:
+                        logger.debug(
+                            f"[{label}] fee={fee}: thin pool "
+                            f"(${usdc_balance_usd:,.0f} USDC), skipping"
+                        )
+                        continue
+                except Exception:
+                    pass  # if check fails, proceed with price fetch anyway
+
                 slot0     = pool.functions.slot0().call()
                 sqrt_px96 = slot0[0]
                 if sqrt_px96 == 0:
@@ -242,10 +273,16 @@ def fetch_prices_for_dex(dex_key: str, dex_cfg: dict) -> list[dict]:
                 continue
             token = tokens[symbol]
 
-            result = _get_pool_price_usd(
-                w3, factories, dex_cfg["fee_tiers"],
-                token, usdc, dex_key,
-            )
+            try:
+                result = _get_pool_price_usd(
+                    w3, factories, dex_cfg["fee_tiers"],
+                    token, usdc, dex_key,
+                )
+            except Exception as sym_exc:
+                logger.warning(
+                    f"[{dex_key}] Skipping {symbol}: {sym_exc}"
+                )
+                continue
 
             if result:
                 records.append({
@@ -265,7 +302,7 @@ def fetch_prices_for_dex(dex_key: str, dex_cfg: dict) -> list[dict]:
                         token_out=usdc["address"],
                     ),
                 })
-                print(f"  [{dex_key}] {symbol:6s} = ${result['price_usd']:,.4f} "
+                print(f"  [{dex_key}] {symbol:8s} = ${result['price_usd']:,.4f} "
                       f"(fee {result['fee']})")
             else:
                 logger.debug(f"[{dex_key}] No pool found for {symbol}/USDC")

@@ -104,28 +104,34 @@ def _build_arb_message(opp: dict) -> str:
         for dex, price in opp.get("all_prices", {}).items()
     )
 
+    same_chain = buy_chain == sell_chain
+    chain_badge = f"✅ SAME-CHAIN ({buy_chain})" if same_chain else f"⛓ CROSS-CHAIN ({buy_chain} → {sell_chain})"
+
     return (
-        f"*ARBITRAGE OPPORTUNITY DETECTED*\n"
+        f"*🔥 ARBITRAGE OPPORTUNITY*\n"
+        f"*{chain_badge}*\n"
         f"\n"
         f"*Pair:*    {symbol}/USDC\n"
         f"*Spread:*  {spread:.3f}%\n"
         f"\n"
         f"*BUY*   on {buy_dex} ({buy_chain})\n"
         f"  Price: `${buy_price:,.4f}`\n"
-        f"  [Open swap on {buy_dex}]({buy_url})\n"
+        f"  [Open swap ↗]({buy_url})\n"
         f"\n"
         f"*SELL*  on {sell_dex} ({sell_chain})\n"
         f"  Price: `${sell_price:,.4f}`\n"
-        f"  [Open swap on {sell_dex}]({sell_url})\n"
+        f"  [Open swap ↗]({sell_url})\n"
         f"\n"
-        f"*Price snapshot:*\n{price_lines}\n"
+        f"*All DEX prices:*\n{price_lines}\n"
         f"\n"
         f"*P&L on ${size:,.0f} trade:*\n"
-        f"  Gross profit:      `${gross:,.2f}`\n"
-        f"  Flash-loan fee:  `-${fl_fee:,.2f}`\n"
-        f"  Gas (both chains): `-${gas:,.2f}`\n"
-        f"  ─────────────────────────\n"
-        f"  *Est. Net Profit:   `${net:,.2f}`*\n"
+        f"  Gross profit:    `${gross:,.2f}`\n"
+        f"  Flash-loan fee: `-${fl_fee:,.2f}`\n"
+        f"  Gas cost:       `-${gas:,.4f}`\n"
+        f"  ──────────────────────────\n"
+        f"  *Est. Net Profit: `${net:,.2f}`*\n"
+        + (f"\n_⚡ Flash-loan executable — check console for Y/N prompt_"
+           if same_chain else "")
     )
 
 

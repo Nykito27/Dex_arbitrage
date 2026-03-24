@@ -251,21 +251,38 @@ def run_cycle(cfg: dict) -> None:
     logger.info("=== Price scan across DEXes ===")
     all_prices, opportunities = scan_all_dexes()
 
-    # ── 3. Store optimal route ────────────────────────────────────────────────
-    best = opportunities[0] if opportunities else None
+    # ── 3. Split same-chain vs cross-chain ───────────────────────────────────
+    same_chain  = [o for o in opportunities if o["buy_chain"] == o["sell_chain"]]
+    cross_chain = [o for o in opportunities if o["buy_chain"] != o["sell_chain"]]
+
+    if cross_chain:
+        for o in cross_chain:
+            logger.debug(
+                f"[Arb] Cross-chain gap skipped "
+                f"({o['symbol']} {o['buy_chain']}→{o['sell_chain']} "
+                f"${o['net_profit']:,.2f}) — not alertable."
+            )
+
+    # ── 4. Store best SAME-CHAIN route for executor ───────────────────────────
+    best = same_chain[0] if same_chain else None
     store_optimal_route(best)
 
-    # ── 4. Telegram alerts ────────────────────────────────────────────────────
-    if opportunities:
-        n = send_arb_alerts(bot, chat, opportunities)
-        logger.info(f"[Arb] {n} opportunity alert(s) sent.")
+    # ── 5. Telegram alerts — same-chain only ──────────────────────────────────
+    if same_chain:
+        n = send_arb_alerts(bot, chat, same_chain)
+        logger.info(f"[Arb] {n} same-chain alert(s) sent.")
+    elif cross_chain:
+        logger.info(
+            f"[Arb] {len(cross_chain)} cross-chain gap(s) found but filtered "
+            "(same-chain only mode). No alerts sent."
+        )
     elif cfg["price_snapshot"]:
         send_price_snapshot(bot, chat, all_prices)
         logger.info("[Arb] No opportunities — price snapshot sent.")
     else:
         logger.info("[Arb] No profitable opportunities this cycle.")
 
-    # ── 5. Execution gate (fires only if secrets are set + confirmed) ─────────
+    # ── 6. Execution gate — same-chain only (fires only if secrets set + confirmed)
     maybe_execute_trade(cfg)
 
 
@@ -283,8 +300,11 @@ def main() -> None:
 
     logger.info("DeFi Arbitrage Hunter starting...")
     logger.info(f"Wallet   : {cfg['wallet_address']}")
-    logger.info(f"DEXes    : Uniswap V3 (Polygon) | SushiSwap (Arbitrum) | PancakeSwap (Base)")
-    logger.info(f"Tokens   : WETH, WBTC, LINK, GHO, USDe, MATIC")
+    logger.info("DEXes    : Polygon  → Uniswap V3  ↔  SushiSwap V3")
+    logger.info("           Arbitrum → Uniswap V3  ↔  SushiSwap V3")
+    logger.info("           Base     → Uniswap V3  ↔  PancakeSwap V3")
+    logger.info(f"Tokens   : {len(__import__('config').WATCHLIST)} symbols monitored")
+    logger.info("Alerts   : Same-chain only (cross-chain gaps silently dropped)")
     logger.info(f"Min profit: $10 USD  |  Trade size: $10,000  |  Flash-loan fee: 0.05%")
     logger.info(f"Executor : {cfg['executor_address'] or 'NOT SET'}")
     logger.info(f"Mode     : {exec_mode}")
