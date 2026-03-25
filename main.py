@@ -35,6 +35,7 @@ import os
 import sys
 import time
 import logging
+import threading
 
 from monitor import (
     check_all_chains,
@@ -72,10 +73,11 @@ def load_config() -> dict:
         "telegram_chat_id":   os.getenv("TELEGRAM_CHAT_ID",          "").strip(),
         "executor_address":   os.getenv("EXECUTOR_CONTRACT_ADDRESS",  "").strip(),
         "private_key":        os.getenv("PRIVATE_KEY",                "").strip(),
+        "private_rpc_url":    os.getenv("PRIVATE_RPC_URL",            "").strip(),
         "run_once":           os.getenv("RUN_ONCE",      "false").lower() == "true",
         "poll_interval":      int(os.getenv("POLL_INTERVAL", "60")),
         "price_snapshot":     os.getenv("PRICE_SNAPSHOT","false").lower() == "true",
-        "keepalive_port":     int(os.getenv("KEEPALIVE_PORT", "8080")),
+        "keepalive_port":     int(os.getenv("KEEPALIVE_PORT", "5050")),
     }
 
     missing = [k for k, v in {
@@ -112,7 +114,11 @@ stats: dict = {
     "last_summary_sent_at":  time.time(),
 }
 
-SUMMARY_INTERVAL_SECS = 4 * 3600   # 4 hours
+_stats_lock = threading.Lock()     # guard stats writes from multiple trade threads
+SUMMARY_INTERVAL_SECS = 4 * 3600  # 4 hours
+
+# Tracks live trade threads — scanner keeps running while they're in flight
+_pending_trade_threads: list[threading.Thread] = []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,7 +192,8 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
 
     # ── Log attempt ──────────────────────────────────────────────────────────
     log_attempt(symbol, chain, buy_dex, sell_dex, est)
-    stats["trades_attempted"] += 1
+    with _stats_lock:
+        stats["trades_attempted"] += 1
 
     logger.info(
         f"[Executor] AUTO-FIRING {symbol} on {chain} | "
@@ -200,8 +207,9 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
         tx_hash      = result["tx_hash"]
         explorer_url = result["explorer_url"]
 
-        stats["trades_succeeded"]      += 1
-        stats["total_est_profit_usd"]  += est
+        with _stats_lock:
+            stats["trades_succeeded"]     += 1
+            stats["total_est_profit_usd"] += est
 
         log_success(symbol, chain, buy_dex, sell_dex, tx_hash, explorer_url, est)
 
@@ -227,9 +235,45 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
         )
 
     except Exception as exc:
-        stats["trades_failed"] += 1
+        with _stats_lock:
+            stats["trades_failed"] += 1
         log_failure(symbol, chain, buy_dex, sell_dex, str(exc), est)
         logger.error(f"[Executor] ❌ Transaction failed: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Async launcher — scanner keeps hunting while the trade is in flight
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fire_trade_async(cfg: dict, opportunity: dict) -> None:
+    """
+    Launch execute_trade() in a daemon thread.
+
+    The scan loop returns immediately and continues looking for the
+    next opportunity — it does not stall waiting for tx confirmation.
+    Completed threads are pruned from _pending_trade_threads on each call.
+    """
+    global _pending_trade_threads
+
+    # Clean up threads that have already finished
+    _pending_trade_threads = [t for t in _pending_trade_threads if t.is_alive()]
+
+    thread_name = (
+        f"trade-{opportunity['symbol']}-{opportunity['buy_chain']}-"
+        f"{int(time.time())}"
+    )
+    t = threading.Thread(
+        target=execute_trade,
+        args=(cfg, opportunity),
+        name=thread_name,
+        daemon=True,
+    )
+    t.start()
+    _pending_trade_threads.append(t)
+    logger.info(
+        f"[Executor] 🚀 Trade thread launched: {thread_name} "
+        f"({len(_pending_trade_threads)} in flight)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,9 +356,9 @@ def run_cycle(cfg: dict) -> None:
     else:
         logger.info("[Arb] No profitable opportunities this cycle.")
 
-    # ── 6. Auto-execute best same-chain opportunity ───────────────────────────
+    # ── 6. Auto-execute best same-chain opportunity (non-blocking) ───────────
     if best:
-        execute_trade(cfg, best)
+        fire_trade_async(cfg, best)   # scanner keeps scanning; trade fires in background
 
     # ── 7. 4-hour summary check ───────────────────────────────────────────────
     maybe_send_summary(cfg)
@@ -336,6 +380,11 @@ def main() -> None:
     start_keepalive_server(port=cfg["keepalive_port"], stats=stats)
 
     # ── Startup banner ───────────────────────────────────────────────────────
+    private_rpc_status = (
+        f"ACTIVE ({cfg['private_rpc_url'][:28]}...)"
+        if cfg["private_rpc_url"] else "not set — using public Polygon RPC"
+    )
+
     logger.info("DeFi Arbitrage Hunter — 100% Autonomous Mode")
     logger.info(f"Wallet    : {cfg['wallet_address']}")
     logger.info("DEXes     : Polygon  → Uniswap V3  ↔  SushiSwap V3")
@@ -346,6 +395,15 @@ def main() -> None:
     logger.info(f"Min profit: $10 USD  |  Trade size: $10,000  |  FL fee: 0.05%")
     logger.info(f"Executor  : {cfg['executor_address'] or 'NOT SET'}")
     logger.info(f"Mode      : {exec_mode}")
+    logger.info("")
+    logger.info("─── Speed Upgrades ────────────────────────────────────────")
+    logger.info(f"  Private RPC   : {private_rpc_status}")
+    logger.info("  Gas strategy  : EIP-1559 aggressive tip × 1.25 (top of block)")
+    logger.info("  Nonce mgmt    : local in-memory (no on-chain roundtrip)")
+    logger.info("  Execution     : async daemon thread (scanner never pauses)")
+    logger.info("  Pre-flight sim: eth_call before every broadcast")
+    logger.info("───────────────────────────────────────────────────────────")
+    logger.info("")
     logger.info(f"KeepAlive : http://0.0.0.0:{cfg['keepalive_port']}/health")
     logger.info(f"Summary   : every 4h via Telegram")
     logger.info(f"Cooldown  : 5m per pair after revert")

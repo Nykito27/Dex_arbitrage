@@ -1,46 +1,40 @@
 """
 flash_loan.py
 -------------
-Flash Loan execution module.
+Flash Loan execution engine — speed-optimised for autonomous HFT arbitrage.
 
-Responsibilities
-----------------
-1. Store the latest optimal arbitrage route each scan cycle.
-2. Build the ABI-encoded ArbParams struct for FlashLoanExecutor.initiateArbitrage().
-3. Fire the transaction on-chain via web3.py with dynamic EIP-1559 gas pricing.
-4. Gate every execution attempt behind pre-flight validation and (optionally)
-   a manual Y/N confirmation prompt.
+Speed features implemented
+--------------------------
+1. Private RPC   — uses PRIVATE_RPC_URL (Polygon) instead of slow public nodes.
+2. Aggressive gas — maxPriorityFeePerGas = network tip × 1.25 to front-run rivals.
+3. Local nonces  — NonceManager tracks nonces in memory; no on-chain roundtrip
+                   between consecutive trades on the same chain.
+4. Pre-flight sim — eth_call simulation before broadcast; cancels if profit gone.
 
-Secrets required (add in Replit Secrets before firing live trades):
-  PRIVATE_KEY                — wallet private key (never hard-code)
+Secrets / env vars (all via os.getenv):
+  PRIVATE_KEY                — wallet private key
   EXECUTOR_CONTRACT_ADDRESS  — deployed FlashLoanExecutor.sol address
-
-Env vars (set automatically, or override in Replit Secrets):
-  MANUAL_CONFIRM  — "true" (default) = prompt Y/N before each trade
-                    "false"           = fire automatically when opportunity found
-
-Cross-chain note
-----------------
-Flash loans require all steps (borrow → swap A → swap B → repay) to fit in a
-SINGLE Ethereum transaction on ONE chain.  Cross-chain gaps detected by the
-hunter are surfaced as alerts but execution is only attempted for same-chain
-opportunities.
+  PRIVATE_RPC_URL            — (optional) private Polygon RPC for low latency
 """
 
 from __future__ import annotations
+
 import json
 import os
+import threading
 import time
 import logging
 from typing import Optional
+
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 
 import config
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Block-explorer base URLs (for printing tx links after broadcast)
+# Block-explorer base URLs
 # ---------------------------------------------------------------------------
 EXPLORER = {
     "Polygon":  "https://polygonscan.com/tx/",
@@ -66,31 +60,104 @@ EXECUTOR_ABI = [
                     {"internalType": "uint256", "name": "minProfit",  "type": "uint256"},
                 ],
                 "internalType": "struct FlashLoanExecutor.ArbParams",
-                "name": "params",
-                "type": "tuple",
+                "name":         "params",
+                "type":         "tuple",
             }
         ],
-        "name": "initiateArbitrage",
-        "outputs": [],
+        "name":            "initiateArbitrage",
+        "outputs":         [],
         "stateMutability": "nonpayable",
-        "type": "function",
+        "type":            "function",
     },
     {
         "inputs": [
             {"internalType": "address", "name": "token",  "type": "address"},
             {"internalType": "uint256", "name": "amount", "type": "uint256"},
         ],
-        "name": "rescueTokens",
-        "outputs": [],
+        "name":            "rescueTokens",
+        "outputs":         [],
         "stateMutability": "nonpayable",
-        "type": "function",
+        "type":            "function",
     },
 ]
 
 # ---------------------------------------------------------------------------
-# Shared state — latest optimal route (updated every scan cycle)
+# Shared optimal route (updated every scan cycle)
 # ---------------------------------------------------------------------------
 optimal_route: dict = {}
+
+# ---------------------------------------------------------------------------
+# Private RPC resolution
+# ---------------------------------------------------------------------------
+_PRIVATE_RPC_URL: str = os.getenv("PRIVATE_RPC_URL", "").strip()
+
+
+def _get_rpc_for_chain(chain: str) -> str:
+    """
+    Return the best available RPC URL for `chain`.
+    Polygon → prefer PRIVATE_RPC_URL if set.
+    All other chains → use the first matching entry in DEXES config.
+    """
+    if chain == "Polygon" and _PRIVATE_RPC_URL:
+        return _PRIVATE_RPC_URL
+    for dex_cfg in config.DEXES.values():
+        if dex_cfg.get("chain") == chain:
+            return dex_cfg["rpc_url"]
+    raise ValueError(f"No RPC URL found for chain '{chain}'")
+
+
+# ---------------------------------------------------------------------------
+# Local Nonce Manager
+# ---------------------------------------------------------------------------
+
+class _NonceManager:
+    """
+    Tracks the wallet nonce in memory so consecutive trades on the same
+    chain never stall waiting for the previous tx to be mined.
+
+    Thread-safe — fire() is called from daemon threads.
+    """
+
+    def __init__(self) -> None:
+        self._lock:   threading.Lock = threading.Lock()
+        self._store:  dict[tuple, int] = {}   # (chain, address_lower) → nonce
+
+    def _key(self, chain: str, address: str) -> tuple:
+        return (chain, address.lower())
+
+    def get_and_increment(self, chain: str, address: str, w3: Web3) -> int:
+        """
+        Return the next nonce to use and immediately increment the local counter.
+        Initialises from the chain's pending tx count on first call per chain.
+        """
+        key = self._key(chain, address)
+        with self._lock:
+            if key not in self._store:
+                on_chain = w3.eth.get_transaction_count(address, "pending")
+                self._store[key] = on_chain
+                logger.debug(
+                    f"[Nonce] Initialised {chain}/{address[:8]}... → {on_chain}"
+                )
+            nonce = self._store[key]
+            self._store[key] += 1
+        return nonce
+
+    def reset(self, chain: str, address: str, w3: Web3) -> None:
+        """Re-sync from chain (call after a nonce-related error)."""
+        fresh = w3.eth.get_transaction_count(address, "pending")
+        key   = self._key(chain, address)
+        with self._lock:
+            self._store[key] = fresh
+        logger.info(
+            f"[Nonce] Reset {chain}/{address[:8]}... → {fresh} (re-synced from chain)"
+        )
+
+    def peek(self, chain: str, address: str) -> Optional[int]:
+        """Return current local nonce without incrementing, or None if not initialised."""
+        return self._store.get(self._key(chain, address))
+
+
+nonce_manager = _NonceManager()
 
 
 # ---------------------------------------------------------------------------
@@ -98,35 +165,13 @@ optimal_route: dict = {}
 # ---------------------------------------------------------------------------
 
 def _get_decimals(chain: str, symbol: str) -> int:
-    """Look up token decimals from config; default to 18."""
-    chain_tokens = config.TOKENS.get(chain, {})
-    token        = chain_tokens.get(symbol, {})
-    return token.get("decimals", 18)
-
-
-def _get_rpc_for_chain(chain: str) -> str:
-    """Return the RPC URL for the given chain name by scanning DEXES config."""
-    for dex_cfg in config.DEXES.values():
-        if dex_cfg.get("chain") == chain:
-            return dex_cfg["rpc_url"]
-    raise ValueError(f"No RPC URL found for chain '{chain}' in config.DEXES")
+    return config.TOKENS.get(chain, {}).get(symbol, {}).get("decimals", 18)
 
 
 def _build_execution_payload(opportunity: dict) -> Optional[dict]:
-    """
-    Build the execution payload for a single arbitrage opportunity.
-
-    Returns a dict with:
-      executable   — True if both legs are on the same chain
-      arb_params   — the ArbParams struct values ready to pass to the contract
-      chain        — chain name (e.g. "Arbitrum")
-      human_readable — plain-English summary for the confirmation prompt
-
-    Returns None if the opportunity dict is missing required fields.
-    """
+    """Build the ABI-encoded execution payload for an opportunity."""
     buy_dex_key  = opportunity.get("buy_dex")
     sell_dex_key = opportunity.get("sell_dex")
-
     if not buy_dex_key or not sell_dex_key:
         return None
 
@@ -140,8 +185,8 @@ def _build_execution_payload(opportunity: dict) -> Optional[dict]:
         return {
             "executable": False,
             "reason": (
-                f"Cross-chain gap: buy on {buy_chain}, sell on {sell_chain}. "
-                "Flash loans are single-chain only. Alert sent for awareness."
+                f"Cross-chain: buy on {buy_chain}, sell on {sell_chain}. "
+                "Flash loans are single-chain only."
             ),
         }
 
@@ -155,9 +200,8 @@ def _build_execution_payload(opportunity: dict) -> Optional[dict]:
     fee_a          = opportunity.get("buy_fee",  500)
     fee_b          = opportunity.get("sell_fee", 500)
 
-    decimals_in = _get_decimals(chain, opportunity["symbol"])
-    loan_amount = int(opportunity["token_amount"] * (10 ** decimals_in))
-
+    decimals_in      = _get_decimals(chain, opportunity["symbol"])
+    loan_amount      = int(opportunity["token_amount"] * (10 ** decimals_in))
     net_profit_usd   = opportunity["net_profit"]
     token_price_usd  = opportunity["buy_price"]
     min_profit_token = (net_profit_usd * 0.80) / token_price_usd
@@ -202,26 +246,22 @@ def _build_execution_payload(opportunity: dict) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def store_optimal_route(opportunity: dict | None) -> None:
-    """
-    Called by the main loop every scan cycle.
-    Persists the best opportunity and its execution payload.
-    """
     global optimal_route
 
     if opportunity is None:
         optimal_route = {"status": "no_opportunity", "updated_at": time.time()}
         return
 
-    payload = _build_execution_payload(opportunity)
+    payload    = _build_execution_payload(opportunity)
     executable = payload.get("executable") if payload else False
 
     optimal_route = {
         "status":     "ready",
         "updated_at": time.time(),
         "symbol":     opportunity["symbol"],
-        "trade_size_usd":            opportunity["trade_size_usd"],
-        "token_amount":              opportunity["token_amount"],
-        "estimated_net_profit_usd":  opportunity["net_profit"],
+        "trade_size_usd":           opportunity["trade_size_usd"],
+        "token_amount":             opportunity["token_amount"],
+        "estimated_net_profit_usd": opportunity["net_profit"],
         "buy": {
             "dex":           opportunity["buy_dex"],
             "chain":         opportunity["buy_chain"],
@@ -242,34 +282,34 @@ def store_optimal_route(opportunity: dict | None) -> None:
     }
 
     logger.info(
-        f"[FlashLoan] Optimal route stored: "
-        f"{opportunity['symbol']} | "
-        f"buy on {opportunity['buy_chain']} @ ${opportunity['buy_price']:,.4f} | "
-        f"sell on {opportunity['sell_chain']} @ ${opportunity['sell_price']:,.4f} | "
-        f"net ≈ ${opportunity['net_profit']:,.2f} | "
-        f"executable={executable}"
+        f"[FlashLoan] Route stored: {opportunity['symbol']} | "
+        f"buy {opportunity['buy_chain']} @${opportunity['buy_price']:,.4f} | "
+        f"sell {opportunity['sell_chain']} @${opportunity['sell_price']:,.4f} | "
+        f"net≈${opportunity['net_profit']:,.2f} | executable={executable}"
     )
 
 
 def get_optimal_route() -> dict:
-    """Return the latest stored optimal route."""
     return optimal_route
 
 
 def dump_optimal_route_json() -> str:
-    """Serialize the current optimal route to a JSON string."""
     return json.dumps(optimal_route, indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
-# FlashLoanExecutor — on-chain transaction builder and broadcaster
+# FlashLoanExecutor
 # ---------------------------------------------------------------------------
 
 class FlashLoanExecutor:
     """
-    Builds, validates, and fires the initiateArbitrage() transaction.
+    Builds, validates, and broadcasts initiateArbitrage() — speed-optimised.
 
-    Instantiate once at startup; call fire() when ready to execute.
+    Speed path:
+      1. Private RPC (PRIVATE_RPC_URL) for Polygon — bypasses rate-limited public nodes.
+      2. Aggressive EIP-1559 tip (×1.25) — pushes tx to top of validator queue.
+      3. Local nonce — skips on-chain nonce query for back-to-back trades.
+      4. Pre-flight eth_call — cancels instantly if profit has evaporated.
     """
 
     def __init__(self,
@@ -283,16 +323,8 @@ class FlashLoanExecutor:
     # ------------------------------------------------------------------
 
     def validate_ready(self) -> tuple[bool, str]:
-        """
-        Check that the executor is fully configured before touching real money.
-
-        Returns (True, "OK") or (False, "<reason>").
-        """
         if not self.contract_address:
-            return False, (
-                "EXECUTOR_CONTRACT_ADDRESS is not set. "
-                "Add it in Replit Secrets (Secrets tab)."
-            )
+            return False, "EXECUTOR_CONTRACT_ADDRESS is not set."
         try:
             Web3.to_checksum_address(self.contract_address)
         except Exception:
@@ -301,87 +333,127 @@ class FlashLoanExecutor:
                 "is not a valid EVM address."
             )
         if not self.private_key:
-            return False, (
-                "PRIVATE_KEY is not set. "
-                "Add your wallet private key in Replit Secrets."
-            )
+            return False, "PRIVATE_KEY is not set."
         if len(self.private_key) not in (64, 66):
-            return False, (
-                "PRIVATE_KEY looks malformed (expected 64 hex chars or 0x-prefixed 66)."
-            )
+            return False, "PRIVATE_KEY looks malformed (expected 64 hex or 0x-prefixed 66)."
         return True, "OK"
 
     # ------------------------------------------------------------------
-    # Dynamic gas pricing
+    # Aggressive EIP-1559 gas
     # ------------------------------------------------------------------
 
     @staticmethod
     def _build_gas_params(w3: Web3) -> dict:
         """
-        Return EIP-1559 gas params when the chain supports them,
-        otherwise fall back to a legacy gasPrice with a 20% buffer.
+        EIP-1559 gas with a 25% priority-tip boost over the network average.
 
-        EIP-1559 formula:
-          maxPriorityFeePerGas = suggested tip from node
-          maxFeePerGas         = (2 × baseFee) + tip
-          — the 2× multiplier means the tx still lands even if the next
-            two blocks double the base fee (very safe margin).
+        Formula:
+          aggressive_tip  = network_tip × 1.25
+          maxFeePerGas    = (2 × baseFee) + aggressive_tip
+
+        The 25% tip premium pushes our tx above the median pending tx and to
+        the top of most validator priority queues without overpaying wildly.
+        Falls back to legacy gasPrice × 1.20 if EIP-1559 is unsupported.
         """
         try:
             block    = w3.eth.get_block("latest")
             base_fee = block.get("baseFeePerGas")
 
             if base_fee is not None:
-                tip = w3.eth.max_priority_fee          # node's suggested tip
-                max_fee = (2 * base_fee) + tip
+                network_tip    = w3.eth.max_priority_fee
+                aggressive_tip = int(network_tip * 1.25)   # 25% above average
+                max_fee        = (2 * base_fee) + aggressive_tip
+
                 logger.debug(
-                    f"[Gas] EIP-1559: baseFee={base_fee} tip={tip} maxFee={max_fee}"
+                    f"[Gas] EIP-1559 aggressive: baseFee={base_fee} "
+                    f"tip={network_tip}→{aggressive_tip} maxFee={max_fee}"
                 )
                 return {
-                    "maxPriorityFeePerGas": tip,
+                    "maxPriorityFeePerGas": aggressive_tip,
                     "maxFeePerGas":         max_fee,
                 }
-        except Exception as e:
-            logger.debug(f"[Gas] EIP-1559 fetch failed ({e}), falling back to legacy")
+        except Exception as exc:
+            logger.debug(f"[Gas] EIP-1559 fetch failed ({exc}), falling back to legacy")
 
-        # Legacy fallback (+20% buffer so the tx is competitive)
         gas_price = w3.eth.gas_price
         buffered  = int(gas_price * 1.20)
-        logger.debug(f"[Gas] Legacy: gasPrice={gas_price} (+20% → {buffered})")
+        logger.debug(f"[Gas] Legacy gasPrice: {gas_price} → {buffered} (+20%)")
         return {"gasPrice": buffered}
+
+    # ------------------------------------------------------------------
+    # Pre-flight simulation (eth_call)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _simulate(contract, arb_tuple: tuple, caller: str) -> None:
+        """
+        Dry-run initiateArbitrage() via eth_call.
+
+        Raises ContractLogicError / Exception if the tx would revert,
+        letting the caller cancel before spending gas.
+        """
+        contract.functions.initiateArbitrage(arb_tuple).call({"from": caller})
 
     # ------------------------------------------------------------------
     # Transaction builder
     # ------------------------------------------------------------------
 
-    def build_tx(self, execution_payload: dict) -> dict:
+    def build_tx(self, execution_payload: dict,
+                 w3: Web3,
+                 contract,
+                 arb_tuple: tuple,
+                 caller: str,
+                 chain: str) -> dict:
         """
-        Encode initiateArbitrage() into an unsigned transaction dict.
-
-        Parameters
-        ----------
-        execution_payload : the 'execution' key from optimal_route
-
-        Returns
-        -------
-        Unsigned tx dict — ready for sign_transaction / eth_sendRawTransaction.
+        Encode initiateArbitrage() into a signed-ready tx dict.
+        Uses local NonceManager — no on-chain roundtrip if nonce is known.
         """
+        nonce      = nonce_manager.get_and_increment(chain, caller, w3)
+        gas_params = self._build_gas_params(w3)
+
+        tx = contract.functions.initiateArbitrage(arb_tuple).build_transaction({
+            "from":  caller,
+            "nonce": nonce,
+            "gas":   900_000,
+            **gas_params,
+        })
+        return tx
+
+    # ------------------------------------------------------------------
+    # Broadcaster
+    # ------------------------------------------------------------------
+
+    def fire(self, execution_payload: dict) -> dict:
+        """
+        Simulate → build → sign → broadcast initiateArbitrage().
+
+        Returns {"tx_hash", "explorer_url", "chain"}.
+        Raises on any failure (caller should handle cooldown logic).
+        """
+        # ── 1. Config pre-flight ─────────────────────────────────────────────
+        ready, reason = self.validate_ready()
+        if not ready:
+            raise RuntimeError(f"Pre-flight FAILED: {reason}")
+
         if not execution_payload.get("executable"):
             raise ValueError(
-                "Cannot build tx: "
-                + execution_payload.get("reason", "opportunity is not executable")
+                "Opportunity is not executable: "
+                + execution_payload.get("reason", "unknown")
             )
 
+        # ── 2. Connect via private (or default) RPC ──────────────────────────
         chain   = execution_payload["chain"]
         rpc_url = _get_rpc_for_chain(chain)
-        w3      = Web3(Web3.HTTPProvider(rpc_url))
+        w3      = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 8}))
 
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(self.contract_address),
-            abi=EXECUTOR_ABI,
-        )
+        if not w3.is_connected():
+            raise RuntimeError(f"RPC unreachable: {rpc_url}")
 
-        params = execution_payload["arb_params"]
+        contract_addr = Web3.to_checksum_address(self.contract_address)
+        contract      = w3.eth.contract(address=contract_addr, abi=EXECUTOR_ABI)
+        caller        = w3.eth.account.from_key(self.private_key).address
+
+        params    = execution_payload["arb_params"]
         arb_tuple = (
             Web3.to_checksum_address(params["routerA"]),
             Web3.to_checksum_address(params["routerB"]),
@@ -393,62 +465,43 @@ class FlashLoanExecutor:
             int(params["minProfit"]),
         )
 
-        caller = w3.eth.account.from_key(self.private_key).address
-        nonce  = w3.eth.get_transaction_count(caller, "pending")
-
-        gas_params = self._build_gas_params(w3)
-
-        tx = contract.functions.initiateArbitrage(arb_tuple).build_transaction({
-            "from":  caller,
-            "nonce": nonce,
-            "gas":   900_000,          # generous ceiling — unused gas is refunded
-            **gas_params,
-        })
-        return tx, w3
-
-    # ------------------------------------------------------------------
-    # Broadcaster
-    # ------------------------------------------------------------------
-
-    def fire(self, execution_payload: dict) -> dict:
-        """
-        Validate, sign, and broadcast initiateArbitrage().
-
-        Returns
-        -------
-        {
-          "tx_hash":      "0x...",
-          "explorer_url": "https://arbiscan.io/tx/0x...",
-          "chain":        "Arbitrum",
-        }
-        Raises RuntimeError / ValueError on any pre-flight failure.
-        """
-        # ── 1. Pre-flight checks ─────────────────────────────────────────────
-        ready, reason = self.validate_ready()
-        if not ready:
-            raise RuntimeError(f"[FlashLoan] Pre-flight FAILED: {reason}")
-
-        if not execution_payload.get("executable"):
+        # ── 3. Pre-flight simulation — cancel if profit has evaporated ───────
+        try:
+            self._simulate(contract, arb_tuple, caller)
+            logger.info("[FlashLoan] ✅ Simulation passed — profit still available.")
+        except (ContractLogicError, Exception) as sim_exc:
+            # Re-sync nonce (we never sent anything, so decrement)
+            local = nonce_manager.peek(chain, caller)
+            if local is not None:
+                # simulation failed before we consumed a nonce — harmless
+                pass
             raise ValueError(
-                "[FlashLoan] Opportunity is not executable: "
-                + execution_payload.get("reason", "unknown reason")
+                f"[FlashLoan] ❌ Simulation reverted (profit gone): {sim_exc}"
             )
 
-        # ── 2. Build tx ──────────────────────────────────────────────────────
-        chain   = execution_payload["chain"]
-        tx, w3  = self.build_tx(execution_payload)
+        # ── 4. Build tx with local nonce + aggressive gas ─────────────────────
+        tx     = self.build_tx(execution_payload, w3, contract, arb_tuple, caller, chain)
+        nonce_used = tx["nonce"]
 
-        # ── 3. Sign ──────────────────────────────────────────────────────────
+        # ── 5. Sign ──────────────────────────────────────────────────────────
         signed = w3.eth.account.sign_transaction(tx, self.private_key)
 
-        # ── 4. Broadcast ─────────────────────────────────────────────────────
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        # ── 6. Broadcast ─────────────────────────────────────────────────────
+        try:
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        except Exception as send_exc:
+            err = str(send_exc).lower()
+            if "nonce" in err or "replacement" in err or "already known" in err:
+                logger.warning(
+                    f"[Nonce] Collision on nonce={nonce_used} — re-syncing."
+                )
+                nonce_manager.reset(chain, caller, w3)
+            raise
 
-        explorer_base = EXPLORER.get(chain, "")
-        explorer_url  = f"{explorer_base}{tx_hash}" if explorer_base else tx_hash
+        explorer_url = EXPLORER.get(chain, "") + tx_hash
 
-        logger.info(f"[FlashLoan] Transaction broadcast! hash={tx_hash}")
-        logger.info(f"[FlashLoan] Track it: {explorer_url}")
+        logger.info(f"[FlashLoan] Broadcast! nonce={nonce_used} hash={tx_hash}")
+        logger.info(f"[FlashLoan] Track: {explorer_url}")
 
         return {
             "tx_hash":      tx_hash,

@@ -19,7 +19,12 @@ Public entry point:
 from __future__ import annotations
 
 import logging
+import os
 from web3 import Web3
+
+# Private RPC for Polygon — bypasses rate-limited public nodes for faster scanning.
+# Set PRIVATE_RPC_URL in Replit Secrets to activate.
+_PRIVATE_RPC_URL: str = os.getenv("PRIVATE_RPC_URL", "").strip()
 
 from config import (
     TOKENS,
@@ -244,11 +249,24 @@ def fetch_prices_for_dex(dex_key: str, dex_cfg: dict) -> list[dict]:
         return records
 
     try:
-        w3 = Web3(Web3.HTTPProvider(dex_cfg["rpc_url"],
-                                    request_kwargs={"timeout": 12}))
+        # Use private RPC for Polygon DEXes when PRIVATE_RPC_URL is configured.
+        chain_rpc = (
+            _PRIVATE_RPC_URL
+            if _PRIVATE_RPC_URL and chain_name == "Polygon"
+            else dex_cfg["rpc_url"]
+        )
+        w3 = Web3(Web3.HTTPProvider(chain_rpc, request_kwargs={"timeout": 8}))
         if not w3.is_connected():
-            logger.error(f"[{dex_key}] RPC unreachable: {dex_cfg['rpc_url']}")
-            return records
+            if _PRIVATE_RPC_URL and chain_name == "Polygon":
+                logger.warning(
+                    f"[{dex_key}] Private RPC unreachable ({chain_rpc}), "
+                    "falling back to public node."
+                )
+                w3 = Web3(Web3.HTTPProvider(dex_cfg["rpc_url"],
+                                            request_kwargs={"timeout": 12}))
+            if not w3.is_connected():
+                logger.error(f"[{dex_key}] RPC unreachable: {chain_rpc}")
+                return records
 
         factories = dex_cfg["factories"]
 
