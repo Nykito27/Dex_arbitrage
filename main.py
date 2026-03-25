@@ -37,6 +37,7 @@ import time
 import logging
 import threading
 
+from keep_alive import keep_alive
 from monitor import (
     check_all_chains,
     send_telegram_report,
@@ -51,7 +52,6 @@ from monitor import (
     log_attempt,
     log_success,
     log_failure,
-    start_keepalive_server,
 )
 from monitor.flash_loan import FlashLoanExecutor, get_optimal_route
 
@@ -376,8 +376,8 @@ def main() -> None:
         "monitor-only (add PRIVATE_KEY + EXECUTOR_CONTRACT_ADDRESS to enable trading)"
     )
 
-    # ── Start Flask keep-alive server ────────────────────────────────────────
-    start_keepalive_server(port=cfg["keepalive_port"], stats=stats)
+    # ── Start Flask keep-alive server (port 8080, daemon thread) ─────────────
+    keep_alive()
 
     # ── Startup banner ───────────────────────────────────────────────────────
     private_rpc_status = (
@@ -404,7 +404,7 @@ def main() -> None:
     logger.info("  Pre-flight sim: eth_call before every broadcast")
     logger.info("───────────────────────────────────────────────────────────")
     logger.info("")
-    logger.info(f"KeepAlive : http://0.0.0.0:{cfg['keepalive_port']}/health")
+    logger.info("KeepAlive : http://0.0.0.0:8080/  (pinger URL below)")
     logger.info(f"Summary   : every 4h via Telegram")
     logger.info(f"Cooldown  : 5m per pair after revert")
     logger.info(f"Poll      : every {cfg['poll_interval']}s  (RUN_ONCE={cfg['run_once']})")
