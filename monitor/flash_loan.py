@@ -219,17 +219,31 @@ def _build_execution_payload(opportunity: dict) -> Optional[dict]:
     router_b      = sell_cfg.get("router")
     aave_provider = buy_cfg.get("aave_addresses_provider")
 
-    token_in_addr  = opportunity.get("buy_token_address")
-    token_out_addr = opportunity.get("sell_token_address")
+    # ── Token-direction wiring (matches FlashLoanExecutor.sol semantics) ────
+    # Per the contract:
+    #   tokenIn  = the asset BORROWED from Aave (and repaid). For X/USDC pairs
+    #              this is ALWAYS USDC — we don't borrow the volatile asset.
+    #   tokenOut = the intermediate (the base token, e.g. WETH/WBTC/LINK).
+    # Leg A: USDC → base on routerA  (the cheaper venue = buy_dex)
+    # Leg B: base → USDC on routerB  (the expensive venue = sell_dex)
+    # ───────────────────────────────────────────────────────────────────────
+    quote_cfg = config.TOKENS.get(chain, {}).get("USDC")
+    if not quote_cfg:
+        return {
+            "executable": False,
+            "reason":     f"USDC address not configured for chain {chain}",
+        }
+
+    token_in_addr  = quote_cfg["address"]                          # USDC (borrow)
+    token_out_addr = opportunity.get("buy_token_address")           # base token
     fee_a          = opportunity.get("buy_fee",  500)
     fee_b          = opportunity.get("sell_fee", 500)
 
-    decimals_in      = _get_decimals(chain, opportunity["symbol"])
-    loan_amount      = int(opportunity["token_amount"] * (10 ** decimals_in))
+    quote_decimals = quote_cfg.get("decimals", 6)                   # USDC = 6
+    # Loan amount + minProfit are denominated in tokenIn = USDC
+    loan_amount      = int(opportunity["trade_size_usd"] * (10 ** quote_decimals))
     net_profit_usd   = opportunity["net_profit"]
-    token_price_usd  = opportunity["buy_price"]
-    min_profit_token = (net_profit_usd * 0.80) / token_price_usd
-    min_profit_wei   = int(min_profit_token * (10 ** decimals_in))
+    min_profit_wei   = int(net_profit_usd * 0.80 * (10 ** quote_decimals))
 
     return {
         "executable":              True,
@@ -420,9 +434,29 @@ class FlashLoanExecutor:
         Dry-run initiateArbitrage() via eth_call.
 
         Raises ContractLogicError / Exception if the tx would revert,
-        letting the caller cancel before spending gas.
+        letting the caller cancel before spending gas. On revert we surface
+        the most useful diagnostic we can extract:
+          • Solidity require() string  → "...: profit below minimum"
+          • Empty 0x revert            → likely a DEX-router inner revert
+                                          (path/liquidity/slippage)
+          • The exact arb_tuple        → so the user can replay on Tenderly
         """
-        contract.functions.initiateArbitrage(arb_tuple).call({"from": caller})
+        try:
+            contract.functions.initiateArbitrage(arb_tuple).call({"from": caller})
+        except ContractLogicError as cle:
+            msg = str(cle)
+            if msg.strip() in ("execution reverted", "execution reverted: 0x", ""):
+                # No reason string → almost always an inner DEX call (no pool,
+                # tokenIn==tokenOut, slippage limit, or insufficient liquidity).
+                hint = (
+                    "empty revert (no reason). Most likely cause: a DEX "
+                    "router rejected the swap (no pool at this fee tier, "
+                    "or the borrowed size exceeds available liquidity). "
+                    f"arb_tuple={arb_tuple}"
+                )
+                raise ContractLogicError(hint) from cle
+            # Solidity reason string came through — re-raise unchanged
+            raise
 
     # ------------------------------------------------------------------
     # Transaction builder
