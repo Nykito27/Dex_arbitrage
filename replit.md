@@ -157,6 +157,45 @@ Watchlist: 43 symbols (see `config.py` `WATCHLIST`).
    - Accept commands from the owner's Telegram chat
 4. Point an external uptime monitor at `/health` to keep the container awake 24/7.
 
+## Free 24/7 via GitHub Actions (alternative to Replit deploy)
+
+A separate, self-contained one-shot runner lets the bot live on **GitHub Actions
+cron** for free (unlimited minutes on public repos).
+
+| File                                  | Purpose                                            |
+|---------------------------------------|----------------------------------------------------|
+| `.github/workflows/main.yml`          | Cron `*/5 * * * *` (every 5 min) + `workflow_dispatch` |
+| `scripts/github_action_runner.py`     | One-shot scan → fire if profit > `$10` → exit (no daemon) |
+
+The runner reuses every existing `monitor/*` module, so logic stays in one
+place. It does **not** start the Telegram command listener or the keep-alive
+server (both are pointless inside a 4-minute CI job).
+
+### GitHub Secrets required for the workflow
+
+Configure in your repo at *Settings → Secrets and variables → Actions → New repository secret*:
+
+| Secret name                  | Required? | Purpose                                              |
+|------------------------------|-----------|------------------------------------------------------|
+| `WALLET_ADDRESS`             | Required  | EVM wallet that owns the executor                    |
+| `PRIVATE_KEY`                | Required  | Signs trade transactions                             |
+| `EXECUTOR_CONTRACT_ADDRESS`  | Required  | Deployed `FlashLoanExecutor.sol` address             |
+| `TELEGRAM_BOT_TOKEN`         | Required  | From @BotFather                                      |
+| `TELEGRAM_CHAT_ID`           | Required  | Where alerts are sent                                |
+| `PRIVATE_RPC_URL_POLYGON`    | Optional  | MEV-protected Polygon RPC (e.g. FastLane)            |
+| `PRIVATE_RPC_URL_ARBITRUM`   | Optional  | MEV-protected Arbitrum RPC (e.g. Flashbots Protect)  |
+| `PRIVATE_RPC_URL_BASE`       | Optional  | MEV-protected Base RPC                               |
+
+Tunable values set inline in `main.yml` (no secret needed): `MIN_PROFIT_USD=10`,
+`SEND_PING=false`.
+
+### Free-tier billing notes
+- **Public repo** → unlimited Actions minutes ✅ truly free.
+- **Private repo** → 2,000 free min/month; 5-min cron with ~3-min runs ≈ 8,640 min/month
+  (would exceed quota — make the repo public, or use a longer cron interval).
+- GitHub's cron can be delayed 5–15 min during peak load. The bot is idempotent
+  (5-min per-pair cooldown prevents double-fires).
+
 ## Recent Architecture Changes
 
 - **Apr 26 2026 — Pro upgrades**: Telegram command center, dynamic profit floor,

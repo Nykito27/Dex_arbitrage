@@ -1,0 +1,68 @@
+name: DeFi Arbitrage Hunter
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Schedule: every 5 minutes (24/7).
+#
+# IMPORTANT — GitHub Actions billing:
+#   • Public repos  → unlimited free Actions minutes ✅
+#   • Private repos → 2,000 free minutes/month (free tier).
+#                     A 5-min cron with ~3-min runs ≈ 8,640 min/month, which
+#                     would exceed the free quota — make this repo PUBLIC for
+#                     truly free 24/7 operation.
+#
+# Note: GitHub's cron scheduler can be delayed by 5–15 minutes during peak load.
+# This is normal; the bot is idempotent (cooldowns prevent double-fires).
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'      # every 5 minutes
+  workflow_dispatch:           # also allow manual "Run workflow" button
+
+permissions:
+  contents: read
+
+# Don't queue overlapping runs — but also don't cancel an in-flight trade.
+concurrency:
+  group: arb-hunter
+  cancel-in-progress: false
+
+jobs:
+  scan-and-execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4         # well under the 5-min cron interval
+
+    env:
+      # ─── Required secrets (configure in GitHub → Settings → Secrets) ─────
+      WALLET_ADDRESS:            ${{ secrets.WALLET_ADDRESS }}
+      PRIVATE_KEY:               ${{ secrets.PRIVATE_KEY }}
+      EXECUTOR_CONTRACT_ADDRESS: ${{ secrets.EXECUTOR_CONTRACT_ADDRESS }}
+      TELEGRAM_BOT_TOKEN:        ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:          ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # ─── Optional MEV-protection secrets (any subset) ────────────────────
+      PRIVATE_RPC_URL_POLYGON:   ${{ secrets.PRIVATE_RPC_URL_POLYGON }}
+      PRIVATE_RPC_URL_ARBITRUM:  ${{ secrets.PRIVATE_RPC_URL_ARBITRUM }}
+      PRIVATE_RPC_URL_BASE:      ${{ secrets.PRIVATE_RPC_URL_BASE }}
+
+      # ─── Tunable behaviour (override here, no secret needed) ─────────────
+      MIN_PROFIT_USD: "10"       # only fire trades whose net profit > $10
+      SEND_PING:      "false"    # "true" → also Telegram a ping on no-op runs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "web3>=7.14.1" "requests>=2.32.5"
+
+      - name: Run one-shot scan + execute
+        run: python scripts/github_action_runner.py
