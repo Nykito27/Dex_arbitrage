@@ -130,7 +130,8 @@ def _build_arb_message(opp: dict) -> str:
         f"  Gas cost:       `-${gas:,.4f}`\n"
         f"  ──────────────────────────\n"
         f"  *Est. Net Profit: `${net:,.2f}`*\n"
-        + (f"\n_⚡ Flash-loan executable — check console for Y/N prompt_"
+        + (f"\n_⚡ AUTO-FIRING flash-loan now — eth_call simulation gates the broadcast,_"
+           f"\n_so the trade aborts for free if the price has moved._"
            if same_chain else "")
     )
 
