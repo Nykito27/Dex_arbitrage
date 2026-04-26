@@ -241,8 +241,12 @@ DEXES = {
 # Profit filter constants
 # ---------------------------------------------------------------------------
 
-# Minimum net profit (USD) to trigger a same-chain alert + Y/N prompt
-MIN_NET_PROFIT_USD = 10.0
+# Base floor for the dynamic profit gate.
+# Active floor used by the scanner = MIN_NET_PROFIT_USD + 2.5 × estimated gas cost.
+# This auto-adjusts upward when the network is congested and gas is expensive,
+# so the bot only fires trades whose profit comfortably beats network fees.
+# Live-mutable from Telegram via /setprofit <usd>.
+MIN_NET_PROFIT_USD = 5.0
 
 # Flash loan fee in basis points (0.05% = 5 bps, standard Aave V3)
 FLASH_LOAN_FEE_BPS = 5

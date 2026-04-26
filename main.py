@@ -7,26 +7,33 @@ Each cycle:
   1. Checks native-token wallet balances on Polygon, Arbitrum, Base.
   2. Scans all DEXes for every token in the watchlist.
   3. Calculates net profit after gas fees and flash-loan fee (0.05%).
-  4. Sends a Telegram alert for same-chain opportunities > $10.
-  5. Auto-fires initiateArbitrage() on the FlashLoanExecutor contract
-     without waiting for manual Y/N confirmation.
-  6. On tx revert: logs the error to trade_history.log and puts the
+  4. Compares net profit to the DYNAMIC floor: base + 2.5 × gas cost.
+  5. Sends a Telegram alert for same-chain opportunities above the floor.
+  6. Auto-fires initiateArbitrage() on the FlashLoanExecutor contract via
+     a private (MEV-protected) RPC bundle when one is configured for the chain.
+  7. On tx revert: logs the error to trade_history.log and puts the
      token pair on a 5-minute cooldown before retrying.
-  7. Sends a 4-hour rolling summary to Telegram.
-  8. Serves /health on port 8080 for external uptime monitors.
+  8. Sends a 4-hour rolling summary + a 6-hour heartbeat pulse.
+  9. Listens for Telegram chat commands: /status /setprofit /toggle /gas
+ 10. Serves /health on port 8080 (waitress) for external uptime monitors.
 
 Required Replit Secrets (all read via os.getenv):
   WALLET_ADDRESS            — EVM wallet to monitor balances
   TELEGRAM_BOT_TOKEN        — from Telegram @BotFather
-  TELEGRAM_CHAT_ID          — target chat for alerts
+  TELEGRAM_CHAT_ID          — owner chat (alerts + command authorisation)
   PRIVATE_KEY               — wallet private key that owns the contract
   EXECUTOR_CONTRACT_ADDRESS — deployed FlashLoanExecutor.sol address
 
-Optional env vars:
+Optional MEV-protection / speed secrets:
+  PRIVATE_RPC_URL_POLYGON   — e.g. FastLane MEV Protect endpoint
+  PRIVATE_RPC_URL_ARBITRUM  — e.g. Flashbots Protect endpoint
+  PRIVATE_RPC_URL_BASE      — private Base endpoint
+  PRIVATE_RPC_URL           — legacy single-URL fallback (treated as Polygon)
+
+Optional behaviour env vars:
   RUN_ONCE        — "true" → single pass then exit
   POLL_INTERVAL   — seconds between scans (default 60)
   PRICE_SNAPSHOT  — "true" → send full price table when no arb found
-  KEEPALIVE_PORT  — port for the Flask keep-alive server (default 8080)
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from monitor import (
     send_price_snapshot,
     send_trade_executed,
     send_4h_summary,
+    send_heartbeat,
     scan_all_dexes,
     store_optimal_route,
     is_on_cooldown,
@@ -52,6 +60,9 @@ from monitor import (
     log_attempt,
     log_success,
     log_failure,
+    bot_state,
+    start_telegram_command_listener,
+    get_private_rpc_status,
 )
 from monitor.flash_loan import FlashLoanExecutor, get_optimal_route
 
@@ -73,11 +84,9 @@ def load_config() -> dict:
         "telegram_chat_id":   os.getenv("TELEGRAM_CHAT_ID",          "").strip(),
         "executor_address":   os.getenv("EXECUTOR_CONTRACT_ADDRESS",  "").strip(),
         "private_key":        os.getenv("PRIVATE_KEY",                "").strip(),
-        "private_rpc_url":    os.getenv("PRIVATE_RPC_URL",            "").strip(),
         "run_once":           os.getenv("RUN_ONCE",      "false").lower() == "true",
         "poll_interval":      int(os.getenv("POLL_INTERVAL", "60")),
         "price_snapshot":     os.getenv("PRICE_SNAPSHOT","false").lower() == "true",
-        "keepalive_port":     int(os.getenv("KEEPALIVE_PORT", "5050")),
     }
 
     missing = [k for k, v in {
@@ -98,7 +107,7 @@ def load_config() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global stats — shared with Flask /status endpoint and 4h summary
+# Global stats — shared with /status endpoint and 4h summary
 # ─────────────────────────────────────────────────────────────────────────────
 
 _bot_start_time = time.time()
@@ -112,10 +121,12 @@ stats: dict = {
     "trades_failed":         0,
     "total_est_profit_usd":  0.0,
     "last_summary_sent_at":  time.time(),
+    "last_heartbeat_at":     time.time(),
 }
 
-_stats_lock = threading.Lock()     # guard stats writes from multiple trade threads
-SUMMARY_INTERVAL_SECS = 4 * 3600  # 4 hours
+_stats_lock = threading.Lock()        # guard stats writes from multiple trade threads
+SUMMARY_INTERVAL_SECS   = 4 * 3600    # 4 hours
+HEARTBEAT_INTERVAL_SECS = 6 * 3600    # 6 hours
 
 # Tracks live trade threads — scanner keeps running while they're in flight
 _pending_trade_threads: list[threading.Thread] = []
@@ -136,9 +147,9 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
       1. Check pair cooldown (skip if recently failed).
       2. Pre-flight validate executor config.
       3. Retrieve and verify the stored execution payload.
-      4. Log the attempt.
-      5. Build, sign, and broadcast the transaction.
-      6. On success: log + Telegram notification.
+      4. Log the attempt + record snapshot in bot_state.
+      5. Build, sign, and broadcast via private (or public) RPC.
+      6. On success: log + Telegram notification + bump heartbeat counter.
       7. On failure: log error + set pair cooldown.
     """
     executor_address = cfg["executor_address"]
@@ -190,10 +201,20 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
     hr  = execution["human_readable"]
     est = hr["estimated_profit_usd"]
 
-    # ── Log attempt ──────────────────────────────────────────────────────────
+    # ── Log attempt + snapshot ───────────────────────────────────────────────
     log_attempt(symbol, chain, buy_dex, sell_dex, est)
     with _stats_lock:
         stats["trades_attempted"] += 1
+
+    bot_state.set_last_trade({
+        "symbol":            symbol,
+        "chain":             chain,
+        "buy_dex":           buy_dex,
+        "sell_dex":          sell_dex,
+        "estimated_profit":  est,
+        "outcome":           "PENDING",
+        "ts":                time.time(),
+    })
 
     logger.info(
         f"[Executor] AUTO-FIRING {symbol} on {chain} | "
@@ -210,8 +231,19 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
         with _stats_lock:
             stats["trades_succeeded"]     += 1
             stats["total_est_profit_usd"] += est
+        bot_state.add_executed(1)
 
         log_success(symbol, chain, buy_dex, sell_dex, tx_hash, explorer_url, est)
+
+        bot_state.set_last_trade({
+            "symbol": symbol, "chain": chain,
+            "buy_dex": buy_dex, "sell_dex": sell_dex,
+            "estimated_profit": est,
+            "outcome": "SUCCESS",
+            "tx_hash": tx_hash,
+            "explorer_url": explorer_url,
+            "ts": time.time(),
+        })
 
         logger.info(f"[Executor] ✅ Broadcast! tx={tx_hash}")
         logger.info(f"[Executor]    Track: {explorer_url}")
@@ -238,6 +270,14 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
         with _stats_lock:
             stats["trades_failed"] += 1
         log_failure(symbol, chain, buy_dex, sell_dex, str(exc), est)
+        bot_state.set_last_trade({
+            "symbol": symbol, "chain": chain,
+            "buy_dex": buy_dex, "sell_dex": sell_dex,
+            "estimated_profit": est,
+            "outcome": "FAILED",
+            "error": str(exc)[:200],
+            "ts": time.time(),
+        })
         logger.error(f"[Executor] ❌ Transaction failed: {exc}")
 
 
@@ -246,16 +286,8 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fire_trade_async(cfg: dict, opportunity: dict) -> None:
-    """
-    Launch execute_trade() in a daemon thread.
-
-    The scan loop returns immediately and continues looking for the
-    next opportunity — it does not stall waiting for tx confirmation.
-    Completed threads are pruned from _pending_trade_threads on each call.
-    """
+    """Launch execute_trade() in a daemon thread; scanner returns immediately."""
     global _pending_trade_threads
-
-    # Clean up threads that have already finished
     _pending_trade_threads = [t for t in _pending_trade_threads if t.is_alive()]
 
     thread_name = (
@@ -277,7 +309,7 @@ def fire_trade_async(cfg: dict, opportunity: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4-hour summary sender
+# Periodic Telegram messages — 4h summary + 6h heartbeat
 # ─────────────────────────────────────────────────────────────────────────────
 
 def maybe_send_summary(cfg: dict) -> None:
@@ -295,6 +327,25 @@ def maybe_send_summary(cfg: dict) -> None:
     )
     logger.info("[Summary] 4-hour summary sent to Telegram.")
     stats["last_summary_sent_at"] = time.time()
+
+
+def maybe_send_heartbeat(cfg: dict) -> None:
+    """Send a System Healthy pulse every 6h with opp/exec counts for the window."""
+    if time.time() - stats["last_heartbeat_at"] < HEARTBEAT_INTERVAL_SECS:
+        return
+
+    opps, executed, window_h = bot_state.take_heartbeat_counts()
+    send_heartbeat(
+        cfg["telegram_bot_token"],
+        cfg["telegram_chat_id"],
+        opportunities_found=opps,
+        trades_executed=executed,
+        window_hours=window_h,
+    )
+    logger.info(
+        f"[Heartbeat] 💓 sent: {opps} opps / {executed} executed in last {window_h:.1f}h"
+    )
+    stats["last_heartbeat_at"] = time.time()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -316,6 +367,7 @@ def run_cycle(cfg: dict) -> None:
             logger.info(
                 f"  [{r['name']}] {r['balance']:.6f} {r['native_token']}{flag}"
             )
+    bot_state.set_last_balances(balance_results)
     send_telegram_report(bot, chat, balance_results)
 
     # ── 2. Price scan ─────────────────────────────────────────────────────────
@@ -329,6 +381,7 @@ def run_cycle(cfg: dict) -> None:
 
     stats["same_chain_found"]     += len(same_chain)
     stats["cross_chain_filtered"] += len(cross_chain)
+    bot_state.add_opportunities(len(same_chain))   # heartbeat counter
 
     for o in cross_chain:
         logger.debug(
@@ -358,10 +411,11 @@ def run_cycle(cfg: dict) -> None:
 
     # ── 6. Auto-execute best same-chain opportunity (non-blocking) ───────────
     if best:
-        fire_trade_async(cfg, best)   # scanner keeps scanning; trade fires in background
+        fire_trade_async(cfg, best)   # scanner keeps scanning
 
-    # ── 7. 4-hour summary check ───────────────────────────────────────────────
+    # ── 7. Periodic Telegram pings ────────────────────────────────────────────
     maybe_send_summary(cfg)
+    maybe_send_heartbeat(cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -379,11 +433,17 @@ def main() -> None:
     # ── Start Flask keep-alive server (port 8080, daemon thread) ─────────────
     keep_alive()
 
-    # ── Startup banner ───────────────────────────────────────────────────────
-    private_rpc_status = (
-        f"ACTIVE ({cfg['private_rpc_url'][:28]}...)"
-        if cfg["private_rpc_url"] else "not set — using public Polygon RPC"
+    # ── Start Telegram command listener (daemon thread) ──────────────────────
+    start_telegram_command_listener(
+        cfg["telegram_bot_token"], cfg["telegram_chat_id"]
     )
+
+    # ── Startup banner ───────────────────────────────────────────────────────
+    rpc_status = get_private_rpc_status()
+    rpc_lines  = []
+    for chain in ("Polygon", "Arbitrum", "Base"):
+        tag = "🛡 PRIVATE bundle" if rpc_status.get(chain) else "public mempool"
+        rpc_lines.append(f"    {chain:8s}: {tag}")
 
     logger.info("DeFi Arbitrage Hunter — 100% Autonomous Mode")
     logger.info(f"Wallet    : {cfg['wallet_address']}")
@@ -392,28 +452,40 @@ def main() -> None:
     logger.info("            Base     → Uniswap V3  ↔  PancakeSwap V3")
     logger.info(f"Tokens    : {len(__import__('config').WATCHLIST)} symbols")
     logger.info("Alerts    : Same-chain only — cross-chain gaps silently dropped")
-    logger.info(f"Min profit: $10 USD  |  Trade size: $10,000  |  FL fee: 0.05%")
+    logger.info(
+        f"Min profit: dynamic floor = ${bot_state.min_profit_usd:.2f} + 2.5 × gas  "
+        f"|  Trade size: $10,000  |  FL fee: 0.05%"
+    )
     logger.info(f"Executor  : {cfg['executor_address'] or 'NOT SET'}")
     logger.info(f"Mode      : {exec_mode}")
     logger.info("")
-    logger.info("─── Speed Upgrades ────────────────────────────────────────")
-    logger.info(f"  Private RPC   : {private_rpc_status}")
-    logger.info("  Gas strategy  : EIP-1559 aggressive tip × 1.25 (top of block)")
+    logger.info("─── Speed & MEV Protection ───────────────────────────────")
+    logger.info("  Trade RPC channels:")
+    for line in rpc_lines:
+        logger.info(line)
+    logger.info("  Gas strategy  : EIP-1559 aggressive tip × 1.30 (Fast +30%)")
+    logger.info("  Profit floor  : DYNAMIC (auto-rises with gas)")
     logger.info("  Nonce mgmt    : local in-memory (no on-chain roundtrip)")
     logger.info("  Execution     : async daemon thread (scanner never pauses)")
     logger.info("  Pre-flight sim: eth_call before every broadcast")
-    logger.info("───────────────────────────────────────────────────────────")
+    logger.info("──────────────────────────────────────────────────────────")
     logger.info("")
-    logger.info("KeepAlive : http://0.0.0.0:8080/  (pinger URL below)")
-    logger.info(f"Summary   : every 4h via Telegram")
-    logger.info(f"Cooldown  : 5m per pair after revert")
-    logger.info(f"Poll      : every {cfg['poll_interval']}s  (RUN_ONCE={cfg['run_once']})")
+    logger.info("Telegram cmds: /status  /setprofit <usd>  /toggle  /gas  /help")
+    logger.info("KeepAlive    : http://0.0.0.0:8080/health  (returns 'OK')")
+    logger.info(f"Summary      : every 4h via Telegram")
+    logger.info(f"Heartbeat    : every 6h via Telegram (System Healthy pulse)")
+    logger.info(f"Cooldown     : 5m per pair after revert")
+    logger.info(f"Poll         : every {cfg['poll_interval']}s  (RUN_ONCE={cfg['run_once']})")
 
     if cfg["run_once"]:
         run_cycle(cfg)
         return
 
     while True:
+        if bot_state.paused:
+            logger.info("[Loop] ⏸ Paused via /toggle. Sleeping 5s, will check again.")
+            time.sleep(5)
+            continue
         try:
             run_cycle(cfg)
         except Exception as exc:

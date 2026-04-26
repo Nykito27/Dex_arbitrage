@@ -227,6 +227,38 @@ def send_4h_summary(bot_token: str, chat_id: str, stats: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 6-hour heartbeat (Pulse / Health Check)
+# ---------------------------------------------------------------------------
+
+def send_heartbeat(bot_token: str, chat_id: str,
+                   opportunities_found: int,
+                   trades_executed: int,
+                   window_hours: float = 6.0) -> None:
+    """
+    Pulse message confirming the bot is alive — sent every 6 hours.
+
+    Lists opportunities found vs. executed in the rolling window, so the
+    user can confirm the scanner is genuinely active (not silently stalled).
+    """
+    msg = (
+        f"*💓 System Healthy*\n"
+        f"\n"
+        f"_Last {window_hours:.1f}h activity:_\n"
+        f"  Opportunities found: `{opportunities_found}`\n"
+        f"  Trades executed:     `{trades_executed}`\n"
+        f"\n"
+        f"_Next pulse in 6h._"
+    )
+    try:
+        _send(bot_token, chat_id, msg)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[Telegram] Heartbeat failed: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Price snapshot (sent when no opportunities found)
 # ---------------------------------------------------------------------------
 

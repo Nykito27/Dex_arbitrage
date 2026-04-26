@@ -3,18 +3,28 @@ flash_loan.py
 -------------
 Flash Loan execution engine — speed-optimised for autonomous HFT arbitrage.
 
-Speed features implemented
---------------------------
-1. Private RPC   — uses PRIVATE_RPC_URL (Polygon) instead of slow public nodes.
-2. Aggressive gas — maxPriorityFeePerGas = network tip × 1.25 to front-run rivals.
-3. Local nonces  — NonceManager tracks nonces in memory; no on-chain roundtrip
-                   between consecutive trades on the same chain.
-4. Pre-flight sim — eth_call simulation before broadcast; cancels if profit gone.
+Speed & MEV-protection features
+-------------------------------
+1. Private RPC bundles — per-chain private endpoints (e.g. FastLane on Polygon,
+                         Flashbots Protect on Arbitrum) hide trades from
+                         sandwich bots in the public mempool.
+2. Aggressive gas      — maxPriorityFeePerGas = network tip × 1.30 ("Fast +30%")
+                         so our tx lands at the top of the validator queue.
+3. Local nonces        — NonceManager tracks nonces in memory; no on-chain
+                         roundtrip between consecutive trades on the same chain.
+4. Pre-flight sim      — eth_call simulation before broadcast; cancels for free
+                         if profit has already been arbed away.
 
 Secrets / env vars (all via os.getenv):
   PRIVATE_KEY                — wallet private key
   EXECUTOR_CONTRACT_ADDRESS  — deployed FlashLoanExecutor.sol address
-  PRIVATE_RPC_URL            — (optional) private Polygon RPC for low latency
+
+  Private RPC bundles (any subset; if absent the chain falls back to public):
+    PRIVATE_RPC_URL_POLYGON   — preferred for Polygon (e.g. FastLane MEV Protect)
+    PRIVATE_RPC_URL_ARBITRUM  — preferred for Arbitrum (e.g. Flashbots Protect)
+    PRIVATE_RPC_URL_BASE      — preferred for Base
+    PRIVATE_RPC_URL           — legacy fallback (treated as Polygon's private RPC
+                                if PRIVATE_RPC_URL_POLYGON is not set)
 """
 
 from __future__ import annotations
@@ -87,22 +97,36 @@ EXECUTOR_ABI = [
 optimal_route: dict = {}
 
 # ---------------------------------------------------------------------------
-# Private RPC resolution
+# Private RPC resolution — per-chain MEV-protected endpoints
 # ---------------------------------------------------------------------------
-_PRIVATE_RPC_URL: str = os.getenv("PRIVATE_RPC_URL", "").strip()
+# When set, ALL trade broadcasts on that chain go through the private endpoint
+# instead of the public RPC, hiding the tx from public-mempool sandwich bots.
+_PRIVATE_RPCS: dict[str, str] = {
+    "Polygon":  (os.getenv("PRIVATE_RPC_URL_POLYGON", "").strip()
+                 or os.getenv("PRIVATE_RPC_URL", "").strip()),
+    "Arbitrum": os.getenv("PRIVATE_RPC_URL_ARBITRUM", "").strip(),
+    "Base":     os.getenv("PRIVATE_RPC_URL_BASE",     "").strip(),
+}
 
 
-def _get_rpc_for_chain(chain: str) -> str:
+def get_private_rpc_status() -> dict[str, bool]:
+    """Used by the startup banner — {chain: True if private endpoint configured}."""
+    return {chain: bool(url) for chain, url in _PRIVATE_RPCS.items()}
+
+
+def _get_rpc_for_chain(chain: str) -> tuple[str, bool]:
     """
-    Return the best available RPC URL for `chain`.
-    Polygon → prefer PRIVATE_RPC_URL if set.
-    All other chains → use the first matching entry in DEXES config.
+    Return (rpc_url, is_private) for `chain`.
+
+    Preference: per-chain private RPC → PRIVATE_RPC_URL fallback (Polygon only)
+                → first matching public RPC from DEXES config.
     """
-    if chain == "Polygon" and _PRIVATE_RPC_URL:
-        return _PRIVATE_RPC_URL
+    private = _PRIVATE_RPCS.get(chain, "")
+    if private:
+        return private, True
     for dex_cfg in config.DEXES.values():
         if dex_cfg.get("chain") == chain:
-            return dex_cfg["rpc_url"]
+            return dex_cfg["rpc_url"], False
     raise ValueError(f"No RPC URL found for chain '{chain}'")
 
 
@@ -342,30 +366,36 @@ class FlashLoanExecutor:
     # Aggressive EIP-1559 gas
     # ------------------------------------------------------------------
 
+    # Network "Fast" priority tip + 30% premium (Hyper-Speed Mode).
+    # Kept module-level so /gas can show the same value the bot is paying.
+    PRIORITY_TIP_MULTIPLIER: float = 1.30
+
     @staticmethod
     def _build_gas_params(w3: Web3) -> dict:
         """
-        EIP-1559 gas with a 25% priority-tip boost over the network average.
+        EIP-1559 gas with a 30% priority-tip boost over the network average
+        ("Fast +30% premium" — Hyper-Speed Mode).
 
         Formula:
-          aggressive_tip  = network_tip × 1.25
+          aggressive_tip  = network_tip × 1.30
           maxFeePerGas    = (2 × baseFee) + aggressive_tip
 
-        The 25% tip premium pushes our tx above the median pending tx and to
-        the top of most validator priority queues without overpaying wildly.
+        The 30% tip premium beats other arbitrage bots that typically use the
+        network "Fast" tip at par, landing us at the top of the validator queue.
         Falls back to legacy gasPrice × 1.20 if EIP-1559 is unsupported.
         """
+        mult = FlashLoanExecutor.PRIORITY_TIP_MULTIPLIER
         try:
             block    = w3.eth.get_block("latest")
             base_fee = block.get("baseFeePerGas")
 
             if base_fee is not None:
                 network_tip    = w3.eth.max_priority_fee
-                aggressive_tip = int(network_tip * 1.25)   # 25% above average
+                aggressive_tip = int(network_tip * mult)
                 max_fee        = (2 * base_fee) + aggressive_tip
 
                 logger.debug(
-                    f"[Gas] EIP-1559 aggressive: baseFee={base_fee} "
+                    f"[Gas] EIP-1559 ×{mult}: baseFee={base_fee} "
                     f"tip={network_tip}→{aggressive_tip} maxFee={max_fee}"
                 )
                 return {
@@ -441,13 +471,33 @@ class FlashLoanExecutor:
                 + execution_payload.get("reason", "unknown")
             )
 
-        # ── 2. Connect via private (or default) RPC ──────────────────────────
-        chain   = execution_payload["chain"]
-        rpc_url = _get_rpc_for_chain(chain)
-        w3      = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 8}))
+        # ── 2. Connect via private (MEV-protected) RPC if configured ─────────
+        chain               = execution_payload["chain"]
+        rpc_url, is_private = _get_rpc_for_chain(chain)
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 8}))
 
         if not w3.is_connected():
-            raise RuntimeError(f"RPC unreachable: {rpc_url}")
+            # Private RPC unreachable → fall back to public to avoid a stuck trade
+            if is_private:
+                public_rpc = None
+                for dex_cfg in config.DEXES.values():
+                    if dex_cfg.get("chain") == chain:
+                        public_rpc = dex_cfg["rpc_url"]
+                        break
+                logger.warning(
+                    f"[FlashLoan] Private RPC unreachable ({rpc_url}); "
+                    f"falling back to public RPC. ⚠ trade will be visible in mempool."
+                )
+                if public_rpc:
+                    w3 = Web3(Web3.HTTPProvider(public_rpc, request_kwargs={"timeout": 12}))
+                    is_private = False
+            if not w3.is_connected():
+                raise RuntimeError(f"RPC unreachable: {rpc_url}")
+
+        logger.info(
+            f"[FlashLoan] Broadcast channel: {chain} via "
+            f"{'PRIVATE bundle (MEV-protected)' if is_private else 'public mempool'}"
+        )
 
         contract_addr = Web3.to_checksum_address(self.contract_address)
         contract      = w3.eth.contract(address=contract_addr, abi=EXECUTOR_ABI)

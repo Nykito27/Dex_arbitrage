@@ -32,8 +32,8 @@ from config import (
     WATCHLIST,
     FLASH_LOAN_FEE_BPS,
     TRADE_SIZE_USD,
-    MIN_NET_PROFIT_USD,
 )
+from .bot_state import bot_state
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +283,26 @@ def fetch_prices_for_dex(dex_key: str, dex_cfg: dict) -> list[dict]:
             gas_price_wei * dex_cfg["gas_units"] * native_price / 1e18
         )
 
+        # ── Cache gas snapshot for the /gas Telegram command ────────────────
+        try:
+            block       = w3.eth.get_block("latest")
+            base_fee_wei = block.get("baseFeePerGas")
+            try:
+                tip_wei = w3.eth.max_priority_fee
+            except Exception:
+                tip_wei = None
+
+            bot_state.set_gas(chain_name, {
+                "gas_price_gwei": gas_price_wei / 1e9 if gas_price_wei else None,
+                "base_fee_gwei":  base_fee_wei / 1e9 if base_fee_wei else None,
+                "tip_gwei":       tip_wei / 1e9 if tip_wei else None,
+                # Mirror the multiplier in flash_loan.FlashLoanExecutor.PRIORITY_TIP_MULTIPLIER
+                "aggressive_tip_gwei": (tip_wei * 1.30 / 1e9) if tip_wei else None,
+                "native_price_usd":    native_price,
+            })
+        except Exception:
+            pass  # gas cache is best-effort; never fail a scan over it
+
         print(f"  [{dex_key}] native={native_price:.4f} USD  "
               f"gas≈${gas_cost_usd:.4f}")
 
@@ -368,7 +388,11 @@ def find_arbitrage_opportunities(all_prices: list[dict]) -> list[dict]:
         total_gas      = buy_rec["gas_cost_usd"] + sell_rec["gas_cost_usd"]
         net_profit     = gross_profit - flash_loan_fee - total_gas
 
-        if net_profit > MIN_NET_PROFIT_USD:
+        # Dynamic profit floor: base (live-mutable via /setprofit) + 2.5 × gas
+        # so the bot demands more profit when the network is busy.
+        dynamic_floor = bot_state.dynamic_floor(total_gas)
+
+        if net_profit > dynamic_floor:
             opportunities.append({
                 "symbol":           symbol,
                 "buy_dex":          buy_rec["dex"],          # also used as dex_key
@@ -395,6 +419,7 @@ def find_arbitrage_opportunities(all_prices: list[dict]) -> list[dict]:
                 "trade_size_usd":   TRADE_SIZE_USD,
                 "token_amount":     token_amount,
                 "all_prices":       {r["dex"]: r["price_usd"] for r in records},
+                "min_profit_floor": dynamic_floor,
             })
 
     opportunities.sort(key=lambda x: x["net_profit"], reverse=True)
