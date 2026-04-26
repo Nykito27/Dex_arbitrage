@@ -141,7 +141,7 @@ def main() -> int:
     log.info("  → %d opportunit(ies) clear the strict $%.2f gate",
              len(qualifying), min_profit)
 
-    # ── 3. Telegram alerts (only when something qualifies) ──────────────────
+    # ── 3. No-op exit ───────────────────────────────────────────────────────
     if not qualifying:
         elapsed = time.time() - t0
         log.info("[3/4] No qualifying opportunities — nothing to fire.")
@@ -155,9 +155,10 @@ def main() -> int:
         log.info("[4/4] Done in %.1fs.", elapsed)
         return 0
 
-    send_arb_alerts(bot_token, chat_id, qualifying)
-
-    # ── 4. Auto-fire the best qualifying trade ──────────────────────────────
+    # ── 4. AUTO-FIRE IMMEDIATELY — no Telegram POST before broadcast ────────
+    # Fast-path: cooldown → store route → validate → fire. Every Telegram
+    # alert is deferred until AFTER fire() returns, so the trade goes out as
+    # soon as the eth_call simulation passes — zero alert latency.
     best   = qualifying[0]   # scan_all_dexes already sorts by net_profit desc
     symbol = best["symbol"]
     chain  = best["buy_chain"]
@@ -181,6 +182,8 @@ def main() -> int:
     ready, why = executor.validate_ready()
     if not ready:
         log.error("[3/4] Executor pre-flight failed: %s", why)
+        # Still send the opportunity alert so the user sees we caught it
+        send_arb_alerts(bot_token, chat_id, qualifying)
         return 1
 
     route     = get_optimal_route()
@@ -188,16 +191,24 @@ def main() -> int:
     if not execution.get("executable"):
         log.warning("[3/4] Stored route not executable: %s",
                     execution.get("reason", "unknown"))
+        send_arb_alerts(bot_token, chat_id, qualifying)
         return 0
 
     log_attempt(symbol, chain, buy, sell, est)
-    log.info("[3/4] FIRING: %s on %s | %s → %s | est net $%.2f",
+    log.info("[3/4] FIRING NOW: %s on %s | %s → %s | est net $%.2f",
              symbol, chain, buy, sell, est)
 
+    # ── 5. The hot path: simulation + broadcast (no Telegram in the way) ────
     try:
         result = executor.fire(execution)
         log_success(symbol, chain, buy, sell,
                     result["tx_hash"], result["explorer_url"], est)
+        log.info("[4/4] ✅ Broadcast: %s  (broadcast took %.1fs)",
+                 result["tx_hash"], time.time() - t0)
+
+        # Alerts AFTER broadcast — they can take 200-500ms each, no need to
+        # block the trade waiting for them.
+        send_arb_alerts(bot_token, chat_id, qualifying)
         send_trade_executed(
             bot_token, chat_id,
             symbol=symbol,
@@ -206,14 +217,17 @@ def main() -> int:
             tx_hash=result["tx_hash"],
             explorer_url=result["explorer_url"],
         )
-        log.info("[4/4] ✅ Broadcast: %s  (run took %.1fs)",
-                 result["tx_hash"], time.time() - t0)
         return 0
 
     except Exception as exc:
         log_failure(symbol, chain, buy, sell, str(exc), est)
         log.error("[4/4] ❌ Trade failed: %s  (run took %.1fs)",
                   exc, time.time() - t0)
+        # Tell the user we tried — even on failure, send the opportunity alert
+        try:
+            send_arb_alerts(bot_token, chat_id, qualifying)
+        except Exception:
+            pass
         return 1
 
 

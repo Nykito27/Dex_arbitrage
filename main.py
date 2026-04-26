@@ -390,14 +390,20 @@ def run_cycle(cfg: dict) -> None:
             f"net=${o['net_profit']:,.2f}"
         )
 
-    # ── 4. Store best same-chain route for executor ───────────────────────────
+    # ── 4. Store best route + AUTO-FIRE IMMEDIATELY (zero alert delay) ──────
+    # The trade thread starts BEFORE any Telegram call, so the eth_call sim +
+    # broadcast happen in parallel with the alert HTTP POSTs. This shaves
+    # ~200-500 ms off the detection → broadcast hot path.
     best = same_chain[0] if same_chain else None
     store_optimal_route(best)
 
-    # ── 5. Telegram alerts — same-chain only ─────────────────────────────────
+    if best:
+        fire_trade_async(cfg, best)   # scanner keeps scanning, alerts run in parallel
+
+    # ── 5. Telegram alerts (sent WHILE the trade is already broadcasting) ───
     if same_chain:
         n = send_arb_alerts(bot, chat, same_chain)
-        logger.info(f"[Arb] {n} same-chain alert(s) sent.")
+        logger.info(f"[Arb] {n} same-chain alert(s) sent (trade already in flight).")
     elif cross_chain:
         logger.info(
             f"[Arb] {len(cross_chain)} cross-chain gap(s) filtered "
@@ -408,10 +414,6 @@ def run_cycle(cfg: dict) -> None:
         logger.info("[Arb] No opportunities — price snapshot sent.")
     else:
         logger.info("[Arb] No profitable opportunities this cycle.")
-
-    # ── 6. Auto-execute best same-chain opportunity (non-blocking) ───────────
-    if best:
-        fire_trade_async(cfg, best)   # scanner keeps scanning
 
     # ── 7. Periodic Telegram pings ────────────────────────────────────────────
     maybe_send_summary(cfg)
