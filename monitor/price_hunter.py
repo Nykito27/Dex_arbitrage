@@ -26,6 +26,15 @@ from web3 import Web3
 # Set PRIVATE_RPC_URL in Replit Secrets to activate.
 _PRIVATE_RPC_URL: str = os.getenv("PRIVATE_RPC_URL", "").strip()
 
+# Chain enable filter — comma-separated list. Lets you skip chains where the
+# wallet is unfunded (e.g. set ENABLED_CHAINS=Polygon to ignore Arb/Base
+# entirely until those wallets are topped up). Default = all chains.
+_ENABLED_CHAINS: set[str] = {
+    c.strip()
+    for c in os.getenv("ENABLED_CHAINS", "Polygon,Arbitrum,Base").split(",")
+    if c.strip()
+}
+
 from config import (
     TOKENS,
     DEXES,
@@ -88,6 +97,36 @@ _ERC20_BALANCE_ABI = [
         "stateMutability": "view",
         "type": "function",
     }
+]
+
+# Uniswap V3-compatible QuoterV2 (also used by SushiSwap V3, PancakeSwap V3).
+# Returns the REAL swap output for a given input size — accounts for slippage,
+# tick crossings, and pool depth. We call it via .call() (eth_call), which
+# captures the result even though the function is marked nonpayable.
+_QUOTER_V2_ABI = [
+    {
+        "inputs": [{
+            "components": [
+                {"internalType": "address", "name": "tokenIn",          "type": "address"},
+                {"internalType": "address", "name": "tokenOut",         "type": "address"},
+                {"internalType": "uint256", "name": "amountIn",         "type": "uint256"},
+                {"internalType": "uint24",  "name": "fee",              "type": "uint24"},
+                {"internalType": "uint160", "name": "sqrtPriceLimitX96","type": "uint160"},
+            ],
+            "internalType": "struct IQuoterV2.QuoteExactInputSingleParams",
+            "name": "params",
+            "type": "tuple",
+        }],
+        "name": "quoteExactInputSingle",
+        "outputs": [
+            {"internalType": "uint256", "name": "amountOut",               "type": "uint256"},
+            {"internalType": "uint160", "name": "sqrtPriceX96After",       "type": "uint160"},
+            {"internalType": "uint32",  "name": "initializedTicksCrossed", "type": "uint32"},
+            {"internalType": "uint256", "name": "gasEstimate",             "type": "uint256"},
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
 ]
 
 _NULL_ADDR = "0x0000000000000000000000000000000000000000"
@@ -352,6 +391,104 @@ def fetch_prices_for_dex(dex_key: str, dex_cfg: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Depth-aware swap-output validation (QuoterV2)
+# ---------------------------------------------------------------------------
+
+def _quote_exact_input_single(w3: Web3,
+                               quoter_addr: str,
+                               token_in: str,
+                               token_out: str,
+                               fee: int,
+                               amount_in_raw: int) -> int | None:
+    """
+    Call QuoterV2.quoteExactInputSingle to get the REAL swap output for a
+    given input size on a specific pool. Returns amount_out_raw, or None on
+    any failure (insufficient liquidity, RPC error, bad address, etc.).
+    """
+    try:
+        quoter = w3.eth.contract(
+            address=Web3.to_checksum_address(quoter_addr),
+            abi=_QUOTER_V2_ABI,
+        )
+        params = (
+            Web3.to_checksum_address(token_in),
+            Web3.to_checksum_address(token_out),
+            int(amount_in_raw),
+            int(fee),
+            0,  # sqrtPriceLimitX96 = 0 → no price limit
+        )
+        result = quoter.functions.quoteExactInputSingle(params).call()
+        # Result tuple: (amountOut, sqrtPriceX96After, initializedTicksCrossed, gasEstimate)
+        return int(result[0])
+    except Exception as exc:
+        logger.debug(f"[Quoter] {quoter_addr} fee={fee}: {exc}")
+        return None
+
+
+def _validate_with_quoter(buy_rec: dict,
+                           sell_rec: dict,
+                           trade_size_usd: float) -> float | None:
+    """
+    Compute the REAL net profit by simulating both swap legs through the
+    V3 QuoterV2 contracts of the buy and sell DEXes. This accounts for:
+      - actual pool depth at $TRADE_SIZE_USD borrow size
+      - tick crossings (large trades cross multiple price ticks)
+      - per-pool fee tier slippage
+
+    Returns net profit in USD, or None if validation can't run (e.g.
+    quoter not configured, RPC error, insufficient liquidity).
+    Caller should treat None as "use spot estimate as fallback".
+    """
+    buy_cfg  = DEXES.get(buy_rec["dex"])
+    sell_cfg = DEXES.get(sell_rec["dex"])
+    if not buy_cfg or not sell_cfg:
+        return None
+
+    buy_quoter  = buy_cfg.get("quoter_v2")
+    sell_quoter = sell_cfg.get("quoter_v2")
+    if not buy_quoter or not sell_quoter:
+        return None  # depth check unavailable for this DEX combination
+
+    # USDC has 6 decimals on every chain we support.
+    usdc_in_raw = int(trade_size_usd * 1_000_000)
+
+    try:
+        # ── Leg 1: USDC → base token on the buy DEX ────────────────────────
+        w3_buy = Web3(Web3.HTTPProvider(
+            buy_cfg["rpc_url"], request_kwargs={"timeout": 8}
+        ))
+        base_out_raw = _quote_exact_input_single(
+            w3_buy, buy_quoter,
+            buy_rec["usdc_address"], buy_rec["token_address"],
+            buy_rec["fee_tier"], usdc_in_raw,
+        )
+        if not base_out_raw:
+            return None
+
+        # ── Leg 2: base token → USDC on the sell DEX ───────────────────────
+        w3_sell = Web3(Web3.HTTPProvider(
+            sell_cfg["rpc_url"], request_kwargs={"timeout": 8}
+        ))
+        usdc_out_raw = _quote_exact_input_single(
+            w3_sell, sell_quoter,
+            sell_rec["token_address"], sell_rec["usdc_address"],
+            sell_rec["fee_tier"], base_out_raw,
+        )
+        if usdc_out_raw is None:
+            return None
+
+        usdc_returned = usdc_out_raw / 1_000_000
+        gross_real    = usdc_returned - trade_size_usd
+        flash_fee     = trade_size_usd * (FLASH_LOAN_FEE_BPS / 10_000)
+        gas_total     = buy_rec["gas_cost_usd"] + sell_rec["gas_cost_usd"]
+        return gross_real - flash_fee - gas_total
+
+    except Exception as exc:
+        logger.debug(f"[Quoter] Validation aborted: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Arbitrage detector
 # ---------------------------------------------------------------------------
 
@@ -393,6 +530,31 @@ def find_arbitrage_opportunities(all_prices: list[dict]) -> list[dict]:
         dynamic_floor = bot_state.dynamic_floor(total_gas)
 
         if net_profit > dynamic_floor:
+            # ── Depth-aware validation ──────────────────────────────────────
+            # The slot0 spot price assumes infinite liquidity. At $10k borrow
+            # size the actual swap output is typically lower (you eat 0.05–
+            # 0.30% of slippage per leg depending on pool depth). Use the
+            # V3 QuoterV2 to compute the REAL net profit; if it's still
+            # above the floor, queue the opp using the more accurate number.
+            real_net = _validate_with_quoter(buy_rec, sell_rec, TRADE_SIZE_USD)
+            if real_net is not None:
+                if real_net < dynamic_floor:
+                    logger.info(
+                        f"[Quoter] {symbol} dropped — spot says ${net_profit:,.2f}, "
+                        f"real swap output says ${real_net:,.2f} "
+                        f"< floor ${dynamic_floor:,.2f}"
+                    )
+                    continue
+                logger.info(
+                    f"[Quoter] {symbol} VALIDATED — spot ${net_profit:,.2f} "
+                    f"→ real ${real_net:,.2f}"
+                )
+                gross_profit  = real_net + flash_loan_fee + total_gas
+                net_profit    = real_net
+                profit_source = "quoter"
+            else:
+                profit_source = "spot"
+
             opportunities.append({
                 "symbol":           symbol,
                 "buy_dex":          buy_rec["dex"],          # also used as dex_key
@@ -420,6 +582,7 @@ def find_arbitrage_opportunities(all_prices: list[dict]) -> list[dict]:
                 "token_amount":     token_amount,
                 "all_prices":       {r["dex"]: r["price_usd"] for r in records},
                 "min_profit_floor": dynamic_floor,
+                "profit_source":    profit_source,  # "quoter" or "spot"
             })
 
     opportunities.sort(key=lambda x: x["net_profit"], reverse=True)
@@ -437,8 +600,20 @@ def scan_all_dexes() -> tuple[list[dict], list[dict]]:
     """
     all_prices: list[dict] = []
     for dex_key, dex_cfg in DEXES.items():
+        # Skip chains the operator has disabled (e.g. unfunded wallets).
+        if dex_cfg["chain"] not in _ENABLED_CHAINS:
+            logger.debug(
+                f"[{dex_key}] Chain {dex_cfg['chain']} not in ENABLED_CHAINS "
+                f"({sorted(_ENABLED_CHAINS)}) — skipping"
+            )
+            continue
         prices = fetch_prices_for_dex(dex_key, dex_cfg)
         all_prices.extend(prices)
 
     opportunities = find_arbitrage_opportunities(all_prices)
     return all_prices, opportunities
+
+
+def get_enabled_chains() -> set[str]:
+    """Return the set of chains the scanner is currently configured to scan."""
+    return set(_ENABLED_CHAINS)

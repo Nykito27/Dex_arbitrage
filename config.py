@@ -142,6 +142,8 @@ DEXES = {
         "fee_tiers":   [500, 3000, 10000],
         "gas_units":   300_000,
         "router":      "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+        # QuoterV2 — used for depth-aware swap-output simulation at borrow size
+        "quoter_v2":   "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
         "aave_addresses_provider": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
         "swap_url": (
             "https://app.uniswap.org/#/swap"
@@ -160,6 +162,7 @@ DEXES = {
         "fee_tiers":   [500, 3000, 100, 10000],
         "gas_units":   300_000,
         "router":      "0x0a6e511Fe663827b9cA7e2D2542b20B37fC217A6",
+        "quoter_v2":   "0xb1E835Dc2785b52265711e17fCCb0fd018226a6e",
         "aave_addresses_provider": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
         "swap_url": (
             "https://www.sushi.com/swap"
@@ -177,6 +180,7 @@ DEXES = {
         "fee_tiers":   [500, 3000, 100, 10000],
         "gas_units":   300_000,
         "router":      "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+        "quoter_v2":   "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
         "aave_addresses_provider": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
         "swap_url": (
             "https://app.uniswap.org/#/swap"
@@ -195,6 +199,7 @@ DEXES = {
         "fee_tiers":   [500, 3000, 100, 10000],
         "gas_units":   300_000,
         "router":      "0x8A21F6768C1f8075791D08546Dadf6daA0bE820c",
+        "quoter_v2":   "0x0524E833cCD057e4d7A296e3aaAb9f7675964Ce1",
         "aave_addresses_provider": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
         "swap_url": (
             "https://www.sushi.com/swap"
@@ -212,6 +217,7 @@ DEXES = {
         "fee_tiers":   [500, 3000, 100, 10000],
         "gas_units":   300_000,
         "router":      "0x2626664c2603336E57B271c5C0b26F421741e481",
+        "quoter_v2":   "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
         "aave_addresses_provider": "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D",
         "swap_url": (
             "https://app.uniswap.org/#/swap"
@@ -229,6 +235,7 @@ DEXES = {
         "fee_tiers":   [500, 2500, 100, 10000],
         "gas_units":   300_000,
         "router":      "0x1b81D678ffb9C0263b24A97847620C99d213eB14",
+        "quoter_v2":   "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
         "aave_addresses_provider": "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D",
         "swap_url": (
             "https://pancakeswap.finance/swap"

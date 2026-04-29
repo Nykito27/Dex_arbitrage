@@ -8,6 +8,7 @@ from .telegram_notifier  import (
     send_trade_executed,
     send_4h_summary,
     send_heartbeat,
+    send_alert,
 )
 from .price_hunter       import scan_all_dexes
 from .flash_loan         import (
@@ -36,6 +37,7 @@ __all__ = [
     "send_trade_executed",
     "send_4h_summary",
     "send_heartbeat",
+    "send_alert",
     "scan_all_dexes",
     "FlashLoanExecutor",
     "store_optimal_route",

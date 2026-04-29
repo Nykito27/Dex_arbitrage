@@ -45,10 +45,12 @@ import logging
 import threading
 
 from keep_alive import keep_alive
+from monitor.price_hunter import get_enabled_chains
 from monitor import (
     check_all_chains,
     send_telegram_report,
     send_arb_alerts,
+    send_alert,
     send_price_snapshot,
     send_trade_executed,
     send_4h_summary,
@@ -232,6 +234,10 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
             stats["trades_succeeded"]     += 1
             stats["total_est_profit_usd"] += est
         bot_state.add_executed(1)
+        bot_state.record_trade_outcome(
+            success=True, symbol=symbol, chain=chain,
+            est_profit_usd=est, tx_hash=tx_hash,
+        )
 
         log_success(symbol, chain, buy_dex, sell_dex, tx_hash, explorer_url, est)
 
@@ -269,6 +275,10 @@ def execute_trade(cfg: dict, opportunity: dict) -> None:
     except Exception as exc:
         with _stats_lock:
             stats["trades_failed"] += 1
+        bot_state.record_trade_outcome(
+            success=False, symbol=symbol, chain=chain,
+            est_profit_usd=est, error=str(exc),
+        )
         log_failure(symbol, chain, buy_dex, sell_dex, str(exc), est)
         bot_state.set_last_trade({
             "symbol": symbol, "chain": chain,
@@ -419,6 +429,22 @@ def run_cycle(cfg: dict) -> None:
     maybe_send_summary(cfg)
     maybe_send_heartbeat(cfg)
 
+    # ── 8. Circuit breaker — auto-pause after N consecutive reverts ──────────
+    if bot_state.should_circuit_break():
+        threshold = bot_state.CIRCUIT_BREAKER_THRESHOLD
+        reason    = f"circuit-breaker: {threshold} consecutive trade reverts"
+        bot_state.trip_circuit_breaker(reason)
+        logger.error(f"[CircuitBreaker] {reason} — scanner PAUSED")
+        try:
+            send_alert(
+                bot, chat,
+                "🛑 *Circuit breaker tripped*\n"
+                f"`{threshold}` consecutive trade reverts detected.\n"
+                "Scanner *PAUSED* — investigate then send `/toggle` to resume."
+            )
+        except Exception as exc:
+            logger.warning(f"[CircuitBreaker] alert send failed: {exc}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
@@ -441,10 +467,16 @@ def main() -> None:
     )
 
     # ── Startup banner ───────────────────────────────────────────────────────
-    rpc_status = get_private_rpc_status()
-    rpc_lines  = []
+    rpc_status     = get_private_rpc_status()
+    enabled_chains = get_enabled_chains()
+    rpc_lines      = []
     for chain in ("Polygon", "Arbitrum", "Base"):
-        tag = "🛡 PRIVATE bundle" if rpc_status.get(chain) else "public mempool"
+        if chain not in enabled_chains:
+            tag = "❌ DISABLED (ENABLED_CHAINS)"
+        elif rpc_status.get(chain):
+            tag = "🛡 PRIVATE bundle"
+        else:
+            tag = "public mempool"
         rpc_lines.append(f"    {chain:8s}: {tag}")
 
     logger.info("DeFi Arbitrage Hunter — 100% Autonomous Mode")
@@ -453,6 +485,7 @@ def main() -> None:
     logger.info("            Arbitrum → Uniswap V3  ↔  SushiSwap V3")
     logger.info("            Base     → Uniswap V3  ↔  PancakeSwap V3")
     logger.info(f"Tokens    : {len(__import__('config').WATCHLIST)} symbols")
+    logger.info(f"Chains    : enabled = {sorted(enabled_chains)}")
     logger.info("Alerts    : Same-chain only — cross-chain gaps silently dropped")
     logger.info(
         f"Min profit: dynamic floor = ${bot_state.min_profit_usd:.2f} + 2.5 × gas  "
@@ -470,9 +503,18 @@ def main() -> None:
     logger.info("  Nonce mgmt    : local in-memory (no on-chain roundtrip)")
     logger.info("  Execution     : async daemon thread (scanner never pauses)")
     logger.info("  Pre-flight sim: eth_call before every broadcast")
+    logger.info("  Profit check  : QuoterV2 depth-aware (real swap output @ borrow size)")
+    logger.info("  Safety        : circuit breaker auto-pauses after 5 reverts")
     logger.info("──────────────────────────────────────────────────────────")
     logger.info("")
-    logger.info("Telegram cmds: /status  /setprofit <usd>  /toggle  /gas  /help")
+    logger.info("─── To enable MEV protection, set these Replit Secrets ──")
+    logger.info("  PRIVATE_RPC_URL_POLYGON  = https://polygon-rpc.merkle.io")
+    logger.info("  PRIVATE_RPC_URL_ARBITRUM = https://rpc.flashbots.net (Arbitrum coming)")
+    logger.info("  PRIVATE_RPC_URL_BASE     = https://mainnet-sequencer.base.org")
+    logger.info("  ENABLED_CHAINS           = Polygon  (skip unfunded chains)")
+    logger.info("──────────────────────────────────────────────────────────")
+    logger.info("")
+    logger.info("Telegram cmds: /status /pnl /lasttrades /setprofit /toggle /gas /help")
     logger.info("KeepAlive    : http://0.0.0.0:8080/health  (returns 'OK')")
     logger.info(f"Summary      : every 4h via Telegram")
     logger.info(f"Heartbeat    : every 6h via Telegram (System Healthy pulse)")

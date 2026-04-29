@@ -71,24 +71,38 @@ class TelegramCommandListener:
             "*🤖 Bot Command Center*\n"
             "\n"
             "/status             — balances, last trade, scan state\n"
+            "/pnl                — lifetime P&L (attempted / succeeded / profit)\n"
+            "/lasttrades         — last 10 trade outcomes\n"
             "/setprofit `<usd>`  — change min-profit base floor\n"
             "/toggle             — pause / resume scanner\n"
             "/gas                — gas prices + priority tip in use\n"
             "/help               — this message\n"
             "\n"
-            "_Dynamic floor = base + 2.5 × gas cost_"
+            "_Dynamic floor = base + 2.5 × gas cost_\n"
+            "_Auto-pauses after 5 consecutive reverts (use /toggle to resume)_"
         )
 
     def _cmd_status(self) -> str:
         scan_state = "⏸ *PAUSED*" if bot_state.paused else "▶ *SCANNING*"
         base       = bot_state.min_profit_usd
+        pnl        = bot_state.pnl_snapshot()
 
         lines = [
             "*📊 Bot Status*",
             "",
             f"State: {scan_state}",
+        ]
+        if pnl["pause_reason"]:
+            lines.append(f"Reason: `{pnl['pause_reason']}`")
+        lines += [
             f"Profit floor (base): `${base:,.2f}`",
             "_active floor = base + 2.5 × gas_",
+            "",
+            "*Lifetime P&L:*",
+            f"  Attempted: `{pnl['attempted']}`  |  Succeeded: `{pnl['succeeded']}`  |  Failed: `{pnl['failed']}`",
+            f"  Success rate: `{pnl['success_rate_pct']:.1f}%`",
+            f"  Est. profit: `${pnl['total_est_profit_usd']:,.2f}`",
+            f"  Consecutive reverts: `{pnl['consecutive_reverts']}` / `{pnl['circuit_threshold']}` (auto-pause)",
             "",
             "*Wallet balances:*",
         ]
@@ -146,11 +160,44 @@ class TelegramCommandListener:
 
     def _cmd_toggle(self) -> str:
         now_paused = bot_state.toggle_pause()
+        if now_paused:
+            return "⏸ Scanner *PAUSED*. Use /toggle again to resume."
+        # On resume, clear the circuit breaker so we don't immediately re-trip.
+        bot_state.reset_consecutive_reverts()
+        return "▶ Scanner *RESUMED*. Circuit breaker counter reset."
+
+    def _cmd_pnl(self) -> str:
+        p = bot_state.pnl_snapshot()
         return (
-            "⏸ Scanner *PAUSED*. Use /toggle again to resume."
-            if now_paused else
-            "▶ Scanner *RESUMED*."
+            "*💰 Lifetime P&L*\n"
+            "\n"
+            f"Attempted:   `{p['attempted']}`\n"
+            f"Succeeded:   `{p['succeeded']}`\n"
+            f"Failed:      `{p['failed']}`\n"
+            f"Success rate: `{p['success_rate_pct']:.1f}%`\n"
+            f"Est. profit:  `${p['total_est_profit_usd']:,.2f}`\n"
+            "\n"
+            f"Consecutive reverts: `{p['consecutive_reverts']}` / `{p['circuit_threshold']}`\n"
+            "_(auto-pause when threshold is hit)_"
         )
+
+    def _cmd_lasttrades(self) -> str:
+        trades = bot_state.recent_trades_snapshot(10)
+        if not trades:
+            return "*📜 Last trades*\n_no trades attempted yet_"
+
+        lines = ["*📜 Last 10 trade attempts*", ""]
+        for i, t in enumerate(trades, 1):
+            ts   = datetime.fromtimestamp(t["ts"], tz=timezone.utc)
+            mark = "✅" if t["success"] else "❌"
+            line = (
+                f"{i:>2}. {mark} `{t['symbol']}` on `{t['chain']}` — "
+                f"est `${t['est']:,.2f}` _({ts.strftime('%m-%d %H:%M:%SZ')})_"
+            )
+            if not t["success"] and t["error"]:
+                line += f"\n     err: `{t['error']}`"
+            lines.append(line)
+        return "\n".join(lines)
 
     def _cmd_gas(self) -> str:
         gas = bot_state.last_gas
@@ -201,6 +248,10 @@ class TelegramCommandListener:
             return self._cmd_toggle()
         if head == "/gas":
             return self._cmd_gas()
+        if head == "/pnl":
+            return self._cmd_pnl()
+        if head == "/lasttrades":
+            return self._cmd_lasttrades()
         if head in ("/help", "/start"):
             return self._cmd_help()
         return None

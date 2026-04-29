@@ -30,6 +30,18 @@ def _send(bot_token: str, chat_id: str, text: str) -> None:
     print(f"[Telegram] Message sent (HTTP {resp.status_code}).")
 
 
+def send_alert(bot_token: str, chat_id: str, text: str) -> None:
+    """
+    Public wrapper for ad-hoc Telegram alerts (e.g. circuit breaker tripped,
+    operational warnings). Swallows errors so a failed alert never crashes
+    the caller — best-effort delivery.
+    """
+    try:
+        _send(bot_token, chat_id, text)
+    except Exception as exc:
+        print(f"[Telegram] send_alert failed: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Balance report
 # ---------------------------------------------------------------------------
