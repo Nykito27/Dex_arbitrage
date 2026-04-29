@@ -62,7 +62,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "web3>=7.14.1" "requests>=2.32.5"
+          pip install -r requirements.txt
 
       - name: Run one-shot scan + execute
         run: python scripts/github_action_runner.py

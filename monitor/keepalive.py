@@ -15,11 +15,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from flask import Flask, jsonify
+
+# NOTE: flask is imported lazily inside start_keepalive_server() — NOT at the
+# top of the file — so that environments which never call the keep-alive
+# (e.g. the GitHub Actions one-shot runner) can `import monitor` without
+# needing flask installed at all. The Replit always-on deployment installs
+# flask via requirements.txt and starts the server normally.
 
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
 _start_time = time.time()
 
 # Shared reference to stats so the /status endpoint can read them
@@ -33,26 +37,6 @@ def _uptime_str() -> str:
     return f"{h}h {m}m {s}s"
 
 
-@app.route("/")
-@app.route("/health")
-def health():
-    return jsonify({
-        "status":         "running",
-        "service":        "DeFi Arbitrage Hunter",
-        "uptime":         _uptime_str(),
-        "uptime_seconds": int(time.time() - _start_time),
-    })
-
-
-@app.route("/status")
-def status():
-    return jsonify({
-        "status":  "running",
-        "uptime":  _uptime_str(),
-        "stats":   _stats_ref,
-    })
-
-
 def start_keepalive_server(port: int = 8080,
                            stats: dict | None = None) -> None:
     """
@@ -63,12 +47,42 @@ def start_keepalive_server(port: int = 8080,
     port  : TCP port to listen on (default 8080)
     stats : mutable dict from main.py — exposed at /status
     """
+    # Lazy import — only fail if flask is actually needed at runtime.
+    try:
+        from flask import Flask, jsonify
+    except ImportError:
+        logger.warning(
+            "[KeepAlive] flask not installed — skipping keep-alive server. "
+            "This is fine for one-shot CI runs but should NEVER happen in "
+            "the always-on Replit deployment. Add 'flask' to requirements.txt."
+        )
+        return
+
     if stats is not None:
         _stats_ref.update(stats)
         _stats_ref["_live_ref"] = stats   # keep a pointer for live updates
 
+    app = Flask(__name__)
+
+    @app.route("/")
+    @app.route("/health")
+    def health():
+        return jsonify({
+            "status":         "running",
+            "service":        "DeFi Arbitrage Hunter",
+            "uptime":         _uptime_str(),
+            "uptime_seconds": int(time.time() - _start_time),
+        })
+
+    @app.route("/status")
+    def status():
+        return jsonify({
+            "status":  "running",
+            "uptime":  _uptime_str(),
+            "stats":   _stats_ref,
+        })
+
     def _run():
-        import os
         import logging as _log
         _log.getLogger("werkzeug").setLevel(_log.WARNING)   # quiet Flask logs
         logger.info(f"[KeepAlive] Flask server listening on 0.0.0.0:{port}")
